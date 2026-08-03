@@ -110,6 +110,20 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Enable non-sensitive MemFabric KV checksum verification. 0 disables it
     # (default); 1 enables it and incurs device-to-host synchronization.
     "VLLM_ASCEND_MF_VERIFY": lambda: bool(int(os.getenv("VLLM_ASCEND_MF_VERIFY", "0"))),
+    # Sparse KV LRU implementation. "cpu" keeps the original OpenMP helper;
+    # "npu" uses MemFabric lru_resident_compact and
+    # compute_lru_resident_addrs. This non-sensitive experimental setting is
+    # intended for single-rank validation first.
+    "VLLM_ASCEND_SPARSE_KV_LRU_BACKEND": lambda: os.getenv(
+        "VLLM_ASCEND_SPARSE_KV_LRU_BACKEND", "cpu"
+    ).lower(),
+    # Sparse KV copy implementation. "sparse_copy" keeps the MemFabric AIV
+    # kernel; "cpu" submits ACL H2D/D2H memcpy from the host and therefore
+    # avoids executing the MemFabric sparse_copy kernel. The CPU option is an
+    # eager-mode, single-rank experimental path.
+    "VLLM_ASCEND_SPARSE_KV_COPY_BACKEND": lambda: os.getenv(
+        "VLLM_ASCEND_SPARSE_KV_COPY_BACKEND", "sparse_copy"
+    ).lower(),
 }
 
 # end-env-vars-definition

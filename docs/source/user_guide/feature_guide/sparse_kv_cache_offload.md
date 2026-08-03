@@ -24,6 +24,32 @@ Some other features that can be used together with Sparse KV Cache Offload are a
 
 ## How to use KV Cache offload
 
+### Experimental LRU and copy backends
+
+The sparse KV manager has two independent experimental backend switches:
+
+| Environment variable | Values | Default | Meaning |
+| --- | --- | --- | --- |
+| `VLLM_ASCEND_SPARSE_KV_LRU_BACKEND` | `cpu`, `npu` | `cpu` | Run resident LRU compaction and address generation in the original OpenMP helper or the MemFabric NPU operators. |
+| `VLLM_ASCEND_SPARSE_KV_COPY_BACKEND` | `sparse_copy`, `cpu` | `sparse_copy` | Run the MemFabric AIV `sparse_copy` kernel or submit H2D/D2H copies through the Ascend ACL runtime from the CPU. |
+
+The `npu` LRU and `cpu` copy implementations are currently limited to a
+single TP rank. CPU copy is not graph-capturable and requires eager mode. To
+test NPU LRU management without executing the MemFabric `sparse_copy` kernel:
+
+```bash
+export VLLM_ASCEND_SPARSE_KV_LRU_BACKEND=npu
+export VLLM_ASCEND_SPARSE_KV_COPY_BACKEND=cpu
+
+vllm serve ... --tensor-parallel-size 1 --enforce-eager
+```
+
+The CPU copy backend still requires MemFabric for the host pool and the two NPU
+LRU operators. It only replaces the actual H2D/D2H copy operation. NPU-generated
+copy descriptors are synchronized to the host before ACL memcpy submission, so
+this mode is intended for correctness and compatibility experiments rather than
+performance measurement.
+
 You can enable Sparse KV Cache Offload by setting `sparse_kv_offload_config` in `additional-config`. You also need to specify `SFAPDCpuOffloadConnector` in `kv-transfer-config` for PD KV transfer. Refer to the following example:
 
 ```bash
