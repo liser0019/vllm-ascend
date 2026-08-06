@@ -84,6 +84,9 @@ class DSAResidentTokenPool:
         self._free_indices = deque(range(self.max_num_reqs))
         self._request_to_index: dict[Hashable, int] = {}
         self._request_target_budgets: dict[Hashable, int] = {}
+        # ``_cache_slots`` 按 resident 层数建满。GLM-5.2 的 shared indexer
+        # 层不跑 LIDU，其对应行从不被读写（死行），仅为保持层稠密编号与
+        # all-full 模型逐字节一致；后续可在 shared 拓扑下按 full 层数收缩。
         self._cache_slots = torch.full(
             (
                 self.num_layers,

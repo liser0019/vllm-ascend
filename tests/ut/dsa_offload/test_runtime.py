@@ -4,6 +4,7 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from vllm_ascend.dsa_offload.dram_store import DSAHotDRAMStore
@@ -12,7 +13,10 @@ from vllm_ascend.dsa_offload.request_cache_layout import (
     DSARequestCacheStage,
 )
 from vllm_ascend.dsa_offload.resident_pool import DSAResidentTokenPool
-from vllm_ascend.dsa_offload.runtime import DSAOffloadRuntime
+from vllm_ascend.dsa_offload.runtime import (
+    DSALayerOffloadContext,
+    DSAOffloadRuntime,
+)
 from vllm_ascend.dsa_offload.scheduler_output import (
     DSARequestCacheLayoutProjection,
     DSAResidentBlockTableReplacement,
@@ -80,6 +84,267 @@ def test_lidu_scratch_is_shared_but_cache_slots_remain_per_layer() -> None:
         resident_pool.get_cache_slots(0).data_ptr()
         != resident_pool.get_cache_slots(1).data_ptr()
     )
+
+
+def _register_layer_arenas(store: DSAHotDRAMStore, num_layers: int = 2) -> None:
+    for layer_id in range(num_layers):
+        store.add_layer(
+            layer_id=layer_id,
+            resident_nope_cache=torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+            resident_rope_cache=torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+        )
+
+
+def _full_context(layer_id: int, runtime: DSAOffloadRuntime) -> DSALayerOffloadContext:
+    return DSALayerOffloadContext(
+        layer_id=layer_id,
+        indexer_cache=torch.zeros((2, 4, 128), dtype=torch.bfloat16),
+        runtime=runtime,
+        selection_source_layer_id=None,
+    )
+
+
+def _shared_context(layer_id: int, source_id: int, runtime: DSAOffloadRuntime) -> DSALayerOffloadContext:
+    return DSALayerOffloadContext(
+        layer_id=layer_id,
+        indexer_cache=None,
+        runtime=runtime,
+        selection_source_layer_id=source_id,
+    )
+
+
+def test_full_layer_records_selection_source(monkeypatch) -> None:
+    resident_pool, runtime, store = _make_runtime()
+    _register_layer_arenas(store)
+    lidu_calls: list[dict] = []
+    monkeypatch.setattr(
+        "vllm_ascend.dsa_offload.runtime.lightning_indexer_decode_update",
+        lambda **kw: lidu_calls.append(kw),
+    )
+    monkeypatch.setattr(
+        "vllm_ascend.dsa_offload.runtime.kvcache_scatter_copy",
+        lambda **kw: None,
+    )
+
+    ctx = _full_context(layer_id=0, runtime=runtime)
+    ctx.execute_decode_selection(
+        query=torch.zeros((1, 32, 128), dtype=torch.bfloat16),
+        weights=torch.zeros((1, 32), dtype=torch.bfloat16),
+        row_modes=torch.zeros((1,), dtype=torch.int32),
+        resident_pool_indices=torch.zeros((1,), dtype=torch.int32),
+        actual_seq_lengths_key=torch.ones((1,), dtype=torch.int32),
+        indexer_block_table=torch.zeros((1, 4), dtype=torch.int32),
+        resident_nope_cache=torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+        resident_rope_cache=torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+        resident_block_table=torch.zeros((1, 4), dtype=torch.int32),
+        dram_block_table=torch.zeros((1, 4), dtype=torch.int32),
+    )
+
+    assert lidu_calls, "full 层应跑 LIDU"
+    assert runtime._selection_source_layer == 0
+
+
+def test_shared_layer_reuses_source_outputs_with_own_arenas(monkeypatch) -> None:
+    resident_pool, runtime, store = _make_runtime()
+    _register_layer_arenas(store)
+    monkeypatch.setattr(
+        "vllm_ascend.dsa_offload.runtime.lightning_indexer_decode_update",
+        lambda **kw: None,
+    )
+    ksc_calls: list[dict] = []
+    monkeypatch.setattr(
+        "vllm_ascend.dsa_offload.runtime.kvcache_scatter_copy",
+        lambda **kw: ksc_calls.append(kw),
+    )
+
+    full = _full_context(layer_id=0, runtime=runtime)
+    full.execute_decode_selection(
+        query=torch.zeros((1, 32, 128), dtype=torch.bfloat16),
+        weights=torch.zeros((1, 32), dtype=torch.bfloat16),
+        row_modes=torch.zeros((1,), dtype=torch.int32),
+        resident_pool_indices=torch.zeros((1,), dtype=torch.int32),
+        actual_seq_lengths_key=torch.ones((1,), dtype=torch.int32),
+        indexer_block_table=torch.zeros((1, 4), dtype=torch.int32),
+        resident_nope_cache=torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+        resident_rope_cache=torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+        resident_block_table=torch.zeros((1, 4), dtype=torch.int32),
+        dram_block_table=torch.zeros((1, 4), dtype=torch.int32),
+    )
+    assert len(ksc_calls) == 1  # full 层的 KSC
+
+    shared = _shared_context(layer_id=1, source_id=0, runtime=runtime)
+    result = shared.execute_shared_decode_selection(
+        resident_nope_cache=torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+        resident_rope_cache=torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+        resident_block_table=torch.zeros((1, 4), dtype=torch.int32),
+        dram_block_table=torch.zeros((1, 4), dtype=torch.int32),
+        num_reqs=1,
+    )
+
+    assert len(ksc_calls) == 2  # shared 层又跑一次 KSC
+    shared_ksc = ksc_calls[1]
+    # KSC 用的是本层（layer 1）的 arena，不是源 full 层的。
+    own_arenas = store.get_layer_arenas(1)
+    assert shared_ksc["dram_nope_arena"] is own_arenas.nope
+    assert shared_ksc["dram_rope_arena"] is own_arenas.rope
+    # 复用源 full 层的 LIDU 输出作为 KSC 与 SFA 输入。
+    outputs = runtime.get_lidu_outputs(num_reqs=1)
+    assert shared_ksc["dst_slots"] is outputs.topk_slots
+    assert result.sparse_indices is outputs.topk_slots
+
+
+def test_shared_layer_rejects_stale_or_missing_source(monkeypatch) -> None:
+    resident_pool, runtime, store = _make_runtime()
+    _register_layer_arenas(store)
+    monkeypatch.setattr(
+        "vllm_ascend.dsa_offload.runtime.kvcache_scatter_copy",
+        lambda **kw: None,
+    )
+
+    shared = _shared_context(layer_id=1, source_id=0, runtime=runtime)
+    # 本步尚未有任何 full 层跑 LIDU → 守卫应响。
+    runtime._begin_selection_epoch()
+    with pytest.raises(RuntimeError, match="selection source is stale"):
+        shared.execute_shared_decode_selection(
+            resident_nope_cache=torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+            resident_rope_cache=torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+            resident_block_table=torch.zeros((1, 4), dtype=torch.int32),
+            dram_block_table=torch.zeros((1, 4), dtype=torch.int32),
+            num_reqs=1,
+        )
+    # 来源 id 不匹配同样应响。
+    runtime._selection_source_layer = 5
+    with pytest.raises(RuntimeError, match="selection source is stale"):
+        shared.execute_shared_decode_selection(
+            resident_nope_cache=torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+            resident_rope_cache=torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+            resident_block_table=torch.zeros((1, 4), dtype=torch.int32),
+            dram_block_table=torch.zeros((1, 4), dtype=torch.int32),
+            num_reqs=1,
+        )
+
+
+def test_shared_layer_rejects_lidu_entry() -> None:
+    resident_pool, runtime, store = _make_runtime()
+    _register_layer_arenas(store)
+    shared = _shared_context(layer_id=1, source_id=0, runtime=runtime)
+    with pytest.raises(RuntimeError, match="must not run LIDU"):
+        shared.execute_decode_selection(
+            query=torch.zeros((1, 32, 128), dtype=torch.bfloat16),
+            weights=torch.zeros((1, 32), dtype=torch.bfloat16),
+            row_modes=torch.zeros((1,), dtype=torch.int32),
+            resident_pool_indices=torch.zeros((1,), dtype=torch.int32),
+            actual_seq_lengths_key=torch.ones((1,), dtype=torch.int32),
+            indexer_block_table=torch.zeros((1, 4), dtype=torch.int32),
+            resident_nope_cache=torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+            resident_rope_cache=torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+            resident_block_table=torch.zeros((1, 4), dtype=torch.int32),
+            dram_block_table=torch.zeros((1, 4), dtype=torch.int32),
+        )
+
+
+def test_full_layer_rejects_shared_path() -> None:
+    resident_pool, runtime, store = _make_runtime()
+    _register_layer_arenas(store)
+    full = _full_context(layer_id=0, runtime=runtime)
+    with pytest.raises(RuntimeError, match="must use execute_decode_selection"):
+        full.execute_shared_decode_selection(
+            resident_nope_cache=torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+            resident_rope_cache=torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+            resident_block_table=torch.zeros((1, 4), dtype=torch.int32),
+            dram_block_table=torch.zeros((1, 4), dtype=torch.int32),
+            num_reqs=1,
+        )
+
+
+def _c8_full_context(layer_id: int, runtime: DSAOffloadRuntime) -> DSALayerOffloadContext:
+    return DSALayerOffloadContext(
+        layer_id=layer_id,
+        indexer_cache=torch.zeros((2, 4, 128), dtype=torch.int8),
+        runtime=runtime,
+        selection_source_layer_id=None,
+        indexer_scale_cache=torch.zeros((2, 4, 1), dtype=torch.float16),
+    )
+
+
+def test_c8_full_layer_dispatches_to_quant_lidu_and_raises() -> None:
+    # C8 context 的 decode 选择应路由到 quant LIDU 变体；算子未实现 → 拦截报错。
+    resident_pool, runtime, store = _make_runtime()
+    _register_layer_arenas(store)
+    ctx = _c8_full_context(layer_id=0, runtime=runtime)
+    with pytest.raises(NotImplementedError, match="quantized LIDU"):
+        ctx.execute_decode_selection(
+            query=torch.zeros((1, 32, 128), dtype=torch.int8),
+            weights=torch.zeros((1, 32), dtype=torch.bfloat16),
+            row_modes=torch.zeros((1,), dtype=torch.int32),
+            resident_pool_indices=torch.zeros((1,), dtype=torch.int32),
+            actual_seq_lengths_key=torch.ones((1,), dtype=torch.int32),
+            indexer_block_table=torch.zeros((1, 4), dtype=torch.int32),
+            resident_nope_cache=torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+            resident_rope_cache=torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+            resident_block_table=torch.zeros((1, 4), dtype=torch.int32),
+            dram_block_table=torch.zeros((1, 4), dtype=torch.int32),
+            query_scale=torch.zeros((1,), dtype=torch.float16),
+        )
+
+
+def test_c8_full_layer_requires_query_scale() -> None:
+    # C8 context 缺 query_scale 应在调 quant LIDU 前明确报错。
+    resident_pool, runtime, store = _make_runtime()
+    _register_layer_arenas(store)
+    ctx = _c8_full_context(layer_id=0, runtime=runtime)
+    with pytest.raises(RuntimeError, match="quantized query scale"):
+        ctx.execute_decode_selection(
+            query=torch.zeros((1, 32, 128), dtype=torch.int8),
+            weights=torch.zeros((1, 32), dtype=torch.bfloat16),
+            row_modes=torch.zeros((1,), dtype=torch.int32),
+            resident_pool_indices=torch.zeros((1,), dtype=torch.int32),
+            actual_seq_lengths_key=torch.ones((1,), dtype=torch.int32),
+            indexer_block_table=torch.zeros((1, 4), dtype=torch.int32),
+            resident_nope_cache=torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+            resident_rope_cache=torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+            resident_block_table=torch.zeros((1, 4), dtype=torch.int32),
+            dram_block_table=torch.zeros((1, 4), dtype=torch.int32),
+        )
+
+
+def test_bf16_full_layer_ignores_quant_dispatch(monkeypatch) -> None:
+    # bf16 context（indexer_scale_cache=None）仍走原 LIDU，不触碰 quant 变体。
+    resident_pool, runtime, store = _make_runtime()
+    _register_layer_arenas(store)
+    bf16_lidu: list[dict] = []
+
+    def _boom(**kw):  # quant 变体不应被调用
+        raise AssertionError("quant LIDU must not run for bf16 indexer")
+
+    monkeypatch.setattr(
+        "vllm_ascend.dsa_offload.runtime.lightning_indexer_decode_update",
+        lambda **kw: bf16_lidu.append(kw),
+    )
+    monkeypatch.setattr(
+        "vllm_ascend.dsa_offload.runtime.lightning_indexer_decode_update_quant",
+        _boom,
+    )
+    monkeypatch.setattr(
+        "vllm_ascend.dsa_offload.runtime.kvcache_scatter_copy",
+        lambda **kw: None,
+    )
+
+    ctx = _full_context(layer_id=0, runtime=runtime)
+    ctx.execute_decode_selection(
+        query=torch.zeros((1, 32, 128), dtype=torch.bfloat16),
+        weights=torch.zeros((1, 32), dtype=torch.bfloat16),
+        row_modes=torch.zeros((1,), dtype=torch.int32),
+        resident_pool_indices=torch.zeros((1,), dtype=torch.int32),
+        actual_seq_lengths_key=torch.ones((1,), dtype=torch.int32),
+        indexer_block_table=torch.zeros((1, 4), dtype=torch.int32),
+        resident_nope_cache=torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+        resident_rope_cache=torch.zeros((2, 4, 8), dtype=torch.bfloat16),
+        resident_block_table=torch.zeros((1, 4), dtype=torch.int32),
+        dram_block_table=torch.zeros((1, 4), dtype=torch.int32),
+    )
+
+    assert bf16_lidu, "bf16 层应走原 LIDU 路径"
 
 
 def test_dump_plan_is_compact_and_idempotent() -> None:

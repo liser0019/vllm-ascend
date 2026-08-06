@@ -111,6 +111,35 @@ def lightning_indexer_decode_update(
     )
 
 
+def lightning_indexer_decode_update_quant(
+    *,
+    query: torch.Tensor,
+    query_scale: torch.Tensor,
+    key: torch.Tensor,
+    key_scale: torch.Tensor,
+    weights: torch.Tensor,
+    req_pool_entries: torch.Tensor,
+    cache_slots: torch.Tensor,
+    row_modes: torch.Tensor,
+    actual_seq_lengths_key: torch.Tensor,
+    block_table: torch.Tensor,
+    outputs: DSALightningIndexerOutputs,
+) -> None:
+    """C8 量化 Indexer cache 的 LIDU 变体（int8 K + fp16 scale，query 亦量化）。
+
+    TODO(遗留事项): 接受 int8 key + fp16 key_scale + int8 query + query_scale
+    的 AscendC quant LIDU 算子（目标名
+    ``npu_lightning_indexer_decode_update_quant_out``）尚未实现，本接口仅为
+    后续接入预留。当前 dense 路径的 ``npu_lightning_indexer_quant`` 不维护
+    DSA 逐层 resident slot 状态，不能直接替代。
+    """
+    raise NotImplementedError(
+        "DSA C8 Indexer offload requires a quantized LIDU AscendC operator "
+        "(npu_lightning_indexer_decode_update_quant_out) that is not yet "
+        "implemented. See DSA-offload-GLM5.2适配.md 遗留事项."
+    )
+
+
 def kvcache_scatter_copy(
     *,
     resident_nope_cache: torch.Tensor,

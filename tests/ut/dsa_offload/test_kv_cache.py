@@ -8,6 +8,7 @@ import torch
 
 from vllm_ascend.dsa_offload import kv_cache as dsa_kv_cache
 from vllm_ascend.dsa_offload.kv_cache import (
+    DSAIndexerC8KVSpec,
     DSAIndexerKVSpec,
     DSAResidentMLAAttentionSpec,
     build_dsa_kv_cache_config,
@@ -17,6 +18,7 @@ from vllm_ascend.dsa_offload.kv_cache import (
     get_dsa_group_num_blocks,
     get_dsa_kv_cache_binding_order,
     get_dsa_kv_cache_group_ids,
+    is_dsa_indexer_spec,
     validate_dsa_kv_cache_config,
 )
 from vllm_ascend.dsa_offload.kv_cache_coordinator import (
@@ -72,6 +74,47 @@ def test_indexer_spec_accounts_for_one_vector_per_token() -> None:
     spec = next(spec for spec in _make_specs(num_layers=1).values() if isinstance(spec, DSAIndexerKVSpec))
 
     assert spec.page_size_bytes == 128 * 1 * 128 * 2
+
+
+def test_indexer_c8_spec_splits_k_and_scale_bytes() -> None:
+    spec = DSAIndexerC8KVSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+    )
+
+    # int8 K（128*1*128*1）+ fp16 scale（128*1*1*2）。
+    assert spec.real_page_size_bytes == 128 * 1 * 128 * 1 + 128 * 1 * 1 * 2
+    # C8 spec 仍归入 Indexer plane（isinstance 匹配）。
+    assert is_dsa_indexer_spec(spec)
+
+
+def test_indexer_c8_spec_group_merge_preserves_type_and_size() -> None:
+    # 全 C8 indexer 层 + 全 resident 层：组 merge 应保持 C8 类型与拆分容量。
+    specs: dict[str, DSAIndexerC8KVSpec | DSAResidentMLAAttentionSpec] = {}
+    for layer_idx in range(2):
+        specs[f"model.layers.{layer_idx}.self_attn.indexer.k_cache"] = DSAIndexerC8KVSpec(
+            block_size=128,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.bfloat16,
+        )
+        specs[f"model.layers.{layer_idx}.self_attn.attn"] = DSAResidentMLAAttentionSpec(
+            block_size=128,
+            num_kv_heads=1,
+            head_size=576,
+            sparse_head_dim=(512, 64, 0),
+            dtype=torch.bfloat16,
+            cache_dtype_str="auto",
+        )
+
+    groups = build_dsa_kv_cache_groups(specs)
+
+    assert isinstance(groups[0].kv_cache_spec, DSAIndexerC8KVSpec)
+    assert groups[0].kv_cache_spec.real_page_size_bytes == (
+        128 * 1 * 128 * 1 + 128 * 1 * 1 * 2
+    )
 
 
 def test_split_groups_keep_stable_plane_order() -> None:
@@ -211,7 +254,50 @@ def test_split_groups_reject_missing_per_layer_indexer() -> None:
     specs = _make_specs(num_layers=2)
     del specs["model.layers.1.self_attn.indexer.k_cache"]
 
-    with pytest.raises(RuntimeError, match="one Indexer cache per"):
+    # GLM-5.2 共享 indexer 拓扑下 indexer 层是 resident 层的真子集，
+    # 不再要求每层都有独立 indexer，分组应通过。
+    groups = build_dsa_kv_cache_groups(specs)
+    assert len(groups) == 2
+    assert len(groups[0].layer_names) == 1  # 仅 layer 0 有 indexer
+    assert len(groups[1].layer_names) == 2
+
+
+def test_split_groups_reject_orphan_indexer_without_resident() -> None:
+    # indexer 指向一个不存在 resident 层的 transformer 下标仍属硬错误。
+    specs = _make_specs(num_layers=1)
+    orphan = DSAIndexerKVSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+    )
+    specs["model.layers.7.self_attn.indexer.k_cache"] = orphan
+
+    with pytest.raises(RuntimeError, match="no matching resident MLA layer"):
+        build_dsa_kv_cache_groups(specs)
+
+
+def test_split_groups_reject_more_indexer_than_resident() -> None:
+    specs = _make_specs(num_layers=1)
+    specs["model.layers.1.self_attn.indexer.k_cache"] = DSAIndexerKVSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+    )
+    specs["model.layers.1.self_attn.attn"] = DSAResidentMLAAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=576,
+        sparse_head_dim=(512, 64, 0),
+        dtype=torch.bfloat16,
+        cache_dtype_str="auto",
+    )
+    # 移除唯一 resident 层，使 indexer 数 > resident 数。
+    del specs["model.layers.0.self_attn.attn"]
+    del specs["model.layers.1.self_attn.attn"]
+
+    with pytest.raises(RuntimeError, match="more Indexer caches than resident"):
         build_dsa_kv_cache_groups(specs)
 
 

@@ -773,20 +773,42 @@ class AscendSFAImpl(MLAAttentionImpl):
             raise RuntimeError(
                 f"DSA offload context for {self.layer_name} was bound twice"
             )
-        if self.enable_sparse_sfa_c8 or self.enable_sparse_li_c8:
+        if self.enable_sparse_sfa_c8:
             raise RuntimeError(
-                "DSA offload currently requires bf16/fp16 resident and "
-                "Indexer cache planes"
+                "DSA sparse offload does not support SFA C8 packed resident "
+                "MLA cache; resident MLA planes must stay bf16/fp16."
             )
-        if self.use_index_cache:
-            raise RuntimeError(
-                "DSA sparse offload does not yet support IndexCache or "
-                "skip_topk layer reuse. LIDU maintains layer-local resident "
-                "slot state, while the native IndexCache buffer stores "
-                "cross-layer token top-k indices. Disable use_index_cache "
-                "and configure every sparse-attention layer to compute its "
-                "own top-k indices."
+        if self.enable_sparse_li_c8:
+            # 拦截：C8 量化 Indexer 在 offload 下未实现，报错不进入。
+            # 遗留事项见 DSA-offload-GLM5.2适配.md。
+            raise NotImplementedError(
+                "DSA C8 Indexer offload is not implemented: the quantized "
+                "LIDU AscendC operator is not yet available. Disable sparse "
+                f"LI C8 for offload. layer={self.layer_name}"
             )
+        # context/impl 拓扑一致性：full 层持本层 indexer_cache 且 has_indexer；
+        # shared 层（GLM-5.2）indexer_cache 为 None，须 skip_topk、无本层
+        # indexer、且模型声明了 shared 拓扑（否则 DeepSeek 等未声明拓扑的
+        # skip_topk 层不应进入共享复用路径）。
+        if context.indexer_cache is not None:
+            if not self.has_indexer:
+                raise RuntimeError(
+                    "DSA full-indexer context bound to a layer without a "
+                    f"local indexer: layer={self.layer_name}"
+                )
+        else:
+            caps = get_ascend_config().dsa_offload_config.model_capabilities
+            declared_shared = bool(
+                caps is not None and caps.has_shared_indexer_layers
+            )
+            if not (self.skip_topk and not self.has_indexer and declared_shared):
+                raise RuntimeError(
+                    "DSA shared-indexer context requires a skip_topk layer "
+                    "without a local indexer on a declared shared-indexer "
+                    f"topology: layer={self.layer_name}, skip_topk="
+                    f"{self.skip_topk}, has_indexer={self.has_indexer}, "
+                    f"declared_shared={declared_shared}"
+                )
         self.dsa_offload_context = context
 
     @staticmethod
@@ -1612,12 +1634,14 @@ class AscendSFAImpl(MLAAttentionImpl):
             q_li, q_li_scale = torch_npu.npu_dynamic_quant(q_li.view(-1, self.head_dim), dst_type=self.c8_k_cache_dtype)
             q_li_scale = q_li_scale.to(self.c8_k_scale_cache_dtype)  # [b*s,]
 
-        record_attention_compute_start()
+        # prefetch 门在 forward 的 skip_topk 分支前统一记录，覆盖无本层
+        # indexer 的 shared 层。
         dsa_context = self.dsa_offload_context
         if dsa_context is not None:
             if q_li_scale is not None or self.enable_sparse_li_c8:
-                raise RuntimeError(
-                    "DSA LIDU does not support quantized Indexer cache"
+                raise NotImplementedError(
+                    "DSA LIDU does not support quantized Indexer cache: the "
+                    "quantized LIDU AscendC operator is not yet available."
                 )
             indexer_block_table = attn_metadata.dsa_indexer_block_table
             if indexer_block_table is None:
@@ -2146,8 +2170,42 @@ class AscendSFAImpl(MLAAttentionImpl):
             topk_num_tokens = attn_metadata.dsa_cp_context.local_end_with_pad - attn_metadata.dsa_cp_context.local_start
         else:
             topk_num_tokens = num_input_tokens or hidden_states.shape[0]
+
+        # 为每个 SFA 层打开 prefetch 门。GLM-5.2 的 shared 层复用缓存的
+        # top-K、没有本层 indexer，若在 indexer_select_post_process 内记录
+        # 会让它们的门一直关着。
+        record_attention_compute_start()
+
         if self.skip_topk:
-            topk_indices = self._get_indexcache_topk_indices(topk_num_tokens)
+            # shared indexer 层：DSA decode 下复用所属 full 层的 LIDU 输出
+            # （仅对本层 arena 跑 KSC）；其余（prefill/mixed/非 DSA）仍走
+            # 原生 buffer 路径，读 full 层刚 stash 的 token 级 top-K。
+            dsa_context = self.dsa_offload_context
+            if (
+                dsa_context is not None
+                and attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+            ):
+                if kv_cache is None or len(kv_cache) < 2:
+                    raise RuntimeError(
+                        "DSA shared-indexer decode requires resident NOPE and "
+                        f"ROPE cache planes: layer={self.layer_name}"
+                    )
+                dram_block_table = attn_metadata.dsa_dram_block_table
+                row_modes = attn_metadata.dsa_row_modes
+                if dram_block_table is None or row_modes is None:
+                    raise RuntimeError(
+                        "DSA shared-indexer decode metadata is missing DRAM "
+                        "block table or row modes"
+                    )
+                topk_indices = dsa_context.execute_shared_decode_selection(
+                    resident_nope_cache=kv_cache[0],
+                    resident_rope_cache=kv_cache[1],
+                    resident_block_table=attn_metadata.block_table,
+                    dram_block_table=dram_block_table,
+                    num_reqs=int(row_modes.shape[0]),
+                )
+            else:
+                topk_indices = self._get_indexcache_topk_indices(topk_num_tokens)
         else:
             if not self.has_indexer:
                 raise RuntimeError(f"skip_topk is False but indexer is None. layer_name={self.layer_name}.")
@@ -2162,7 +2220,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
             )
-            if self.use_index_cache:
+            if self.use_index_cache and isinstance(topk_indices, torch.Tensor):
                 self._update_indexcache_topk_indices(topk_indices)
 
         attn_output = self._execute_sparse_flash_attention_process(

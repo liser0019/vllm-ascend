@@ -19,6 +19,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import torch
+
 from vllm.config import VllmConfig
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
@@ -61,6 +63,37 @@ class DSAIndexerKVSpec(FullAttentionSpec):
     @property
     def real_page_size_bytes(self) -> int:
         return self.block_size * self.num_kv_heads * self.head_size * get_dtype_size(self.dtype)
+
+
+@dataclass(frozen=True, kw_only=True)
+class DSAIndexerC8KVSpec(DSAIndexerKVSpec):
+    """C8 量化 Indexer plane（int8 K + 每 token fp16 scale）。
+
+    仅描述容量拆分；scale 的 dtype/维度用类级常量而非实例字段，因为
+    ``FullAttentionSpec.merge`` 只重建基类字段，新增实例字段会在组 merge
+    后悄悄丢回默认值。独立的 class identity 让 isinstance / registry MRO
+    解析仍归入 Indexer plane（见 ``is_dsa_indexer_spec``）。
+
+    TODO(遗留事项): 对应的 AscendC quant LIDU 算子尚未实现；当前 C8
+    indexer 在 bind/spec 阶段被显式拒绝（见 model_runner / sfa_v1），
+    本 spec 仅为后续接入预留容量契约。
+    """
+
+    C8_K_CACHE_DTYPE = torch.int8
+    C8_K_SCALE_DTYPE = torch.float16
+    C8_K_SCALE_DIM = 1
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        k_bytes = (
+            self.block_size * self.num_kv_heads * self.head_size
+            * get_dtype_size(self.C8_K_CACHE_DTYPE)
+        )
+        scale_bytes = (
+            self.block_size * self.num_kv_heads * self.C8_K_SCALE_DIM
+            * get_dtype_size(self.C8_K_SCALE_DTYPE)
+        )
+        return k_bytes + scale_bytes
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -173,12 +206,29 @@ def build_dsa_kv_cache_groups(
             f"resident_layers={len(resident_specs)}, "
             f"foreign_specs={tuple(sorted(type(spec).__name__ for spec in foreign_specs.values()))}"
         )
-    if len(indexer_specs) != len(resident_specs):
+    if len(indexer_specs) > len(resident_specs):
         raise RuntimeError(
-            "DSA split KV-cache requires one Indexer cache per resident MLA "
-            f"layer: indexer_layers={len(indexer_specs)}, "
+            "DSA split KV-cache cannot host more Indexer caches than resident "
+            f"MLA layers: indexer_layers={len(indexer_specs)}, "
             f"resident_layers={len(resident_specs)}"
         )
+
+    # GLM-5.2 共享 indexer 拓扑下 indexer 层是 resident 层的真子集（仅 full
+    # 层建 indexer）。校验每个 indexer 层都有同下标的 resident 层兜底，
+    # 使「indexer 指向不存在的 resident 层」仍然响亮失败。
+    if len(indexer_specs) != len(resident_specs):
+        from vllm.model_executor.models.utils import extract_layer_index
+
+        resident_indices = {extract_layer_index(name) for name in resident_specs}
+        orphan_indexer = sorted(
+            name for name in indexer_specs
+            if extract_layer_index(name) not in resident_indices
+        )
+        if orphan_indexer:
+            raise RuntimeError(
+                "DSA Indexer cache has no matching resident MLA layer: "
+                f"orphan_indexer_layers={tuple(orphan_indexer)}"
+            )
 
     return [
         KVCacheGroupSpec(

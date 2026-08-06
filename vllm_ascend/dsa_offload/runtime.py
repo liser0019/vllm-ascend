@@ -38,6 +38,7 @@ from vllm_ascend.dsa_offload.ops import (
     dump_full_kv_cache_blocks,
     kvcache_scatter_copy,
     lightning_indexer_decode_update,
+    lightning_indexer_decode_update_quant,
     sparse_flash_attention_for_offload,
 )
 from vllm_ascend.dsa_offload.request_cache_layout import (
@@ -205,6 +206,10 @@ class DSAOffloadRuntime:
         self._graph_capture_row_count = 0
         self._dram_table_row_count = 0
         self._dram_table_signature: tuple[int, int, int] | None = None
+        # shared indexer 新鲜度守卫：每步自增 epoch，并记录最近一次跑过
+        # LIDU 的 full 层，shared 层据此校验其 top-K 来源在本步已就绪。
+        self._selection_epoch = 0
+        self._selection_source_layer: int | None = None
 
     def bind_dram_store(self, store: DSAHotDRAMStore) -> None:
         if self.dram_store is not None:
@@ -227,6 +232,11 @@ class DSAOffloadRuntime:
         store = self.dram_store
         if store is not None:
             store.release_pool_index(pool_index)
+
+    def _begin_selection_epoch(self) -> None:
+        """进入新的一轮逐层 decode 选择：自增 epoch 并清空 full 层来源标记。"""
+        self._selection_epoch += 1
+        self._selection_source_layer = None
 
     def prepare_forward(
         self,
@@ -261,6 +271,7 @@ class DSAOffloadRuntime:
         self.active_num_reqs = int(num_reqs)
         self.execution_num_reqs = 0
         self.dump_launch_count = 0
+        self._begin_selection_epoch()
 
         self._prepare_dump_plan(
             input_batch=input_batch,
@@ -383,6 +394,7 @@ class DSAOffloadRuntime:
             )
         self.execution_num_reqs = execution_num_reqs
         self.dump_launch_count = int(launch_count)
+        self._begin_selection_epoch()
         return execution_num_reqs
 
     def prepare_graph_capture(self, *, row_count: int) -> None:
@@ -421,6 +433,7 @@ class DSAOffloadRuntime:
             self.execution_num_reqs = row_count
             self.dump_job_count = 0
             self.dump_launch_count = row_count
+            self._begin_selection_epoch()
         except Exception:
             try:
                 self.restore_after_graph_capture()
@@ -700,11 +713,21 @@ class DSAOffloadRuntime:
 
 @dataclass(frozen=True)
 class DSALayerOffloadContext:
-    """绑定到一个 ``AscendSFAImpl`` 的逐层稳定资源。"""
+    """绑定到一个 ``AscendSFAImpl`` 的逐层稳定资源。
+
+    full indexer 层持有本层 ``indexer_cache``（``selection_source_layer_id``
+    为 None）；GLM-5.2 的 shared indexer 层 ``indexer_cache`` 为 None，
+    用 ``selection_source_layer_id`` 指向所属 full 层，复用其 LIDU 输出。
+
+    ``indexer_scale_cache`` 为 None 表示 bf16/fp16 indexer；非 None（C8
+    量化，int8 K + fp16 scale）时本层走 quant LIDU 变体。
+    """
 
     layer_id: int
-    indexer_cache: torch.Tensor
+    indexer_cache: torch.Tensor | None
     runtime: DSAOffloadRuntime
+    selection_source_layer_id: int | None = None
+    indexer_scale_cache: torch.Tensor | None = None
 
     def execute_decode_selection(
         self,
@@ -719,24 +742,103 @@ class DSALayerOffloadContext:
         resident_rope_cache: torch.Tensor,
         resident_block_table: torch.Tensor,
         dram_block_table: torch.Tensor,
+        query_scale: torch.Tensor | None = None,
     ) -> DSAOffloadSelectionOutput:
+        if self.indexer_cache is None:
+            raise RuntimeError(
+                "DSA shared-indexer layer must not run LIDU selection: "
+                f"layer_id={self.layer_id}"
+            )
         num_reqs = int(query.shape[0])
         outputs = self.runtime.get_lidu_outputs(
             num_reqs=num_reqs,
         )
-        lightning_indexer_decode_update(
-            query=query,
-            key=self.indexer_cache,
-            weights=weights,
-            req_pool_entries=resident_pool_indices,
-            cache_slots=self.runtime.resident_token_pool.get_cache_slots(
-                self.layer_id
-            ),
-            row_modes=row_modes,
-            actual_seq_lengths_key=actual_seq_lengths_key,
-            block_table=indexer_block_table,
-            outputs=outputs,
+        if self.indexer_scale_cache is not None:
+            # C8 量化 Indexer：走 quant LIDU 变体（当前未实现 → 报错拦截）。
+            if query_scale is None:
+                raise RuntimeError(
+                    "DSA C8 Indexer decode requires a quantized query scale: "
+                    f"layer_id={self.layer_id}"
+                )
+            lightning_indexer_decode_update_quant(
+                query=query,
+                query_scale=query_scale,
+                key=self.indexer_cache,
+                key_scale=self.indexer_scale_cache,
+                weights=weights,
+                req_pool_entries=resident_pool_indices,
+                cache_slots=self.runtime.resident_token_pool.get_cache_slots(
+                    self.layer_id
+                ),
+                row_modes=row_modes,
+                actual_seq_lengths_key=actual_seq_lengths_key,
+                block_table=indexer_block_table,
+                outputs=outputs,
+            )
+        else:
+            lightning_indexer_decode_update(
+                query=query,
+                key=self.indexer_cache,
+                weights=weights,
+                req_pool_entries=resident_pool_indices,
+                cache_slots=self.runtime.resident_token_pool.get_cache_slots(
+                    self.layer_id
+                ),
+                row_modes=row_modes,
+                actual_seq_lengths_key=actual_seq_lengths_key,
+                block_table=indexer_block_table,
+                outputs=outputs,
+            )
+        # 记录本步 full 层选择来源，供其 shared 跟随层复用前校验。
+        self.runtime._selection_source_layer = self.layer_id
+        store = self.runtime.dram_store
+        if store is None:
+            raise RuntimeError("DSA layer has no bound DRAM store")
+        arenas = store.get_layer_arenas(self.layer_id)
+        kvcache_scatter_copy(
+            resident_nope_cache=resident_nope_cache,
+            resident_rope_cache=resident_rope_cache,
+            dram_nope_arena=arenas.nope,
+            dram_rope_arena=arenas.rope,
+            resident_block_table=resident_block_table,
+            dram_block_table=dram_block_table,
+            src_token_ids=outputs.topk_index,
+            dst_slots=outputs.topk_slots,
+            copy_counts=outputs.miss_count,
         )
+        return DSAOffloadSelectionOutput(
+            sparse_indices=outputs.topk_slots,
+            tail_info=outputs.tail_info,
+        )
+
+    def execute_shared_decode_selection(
+        self,
+        *,
+        resident_nope_cache: torch.Tensor,
+        resident_rope_cache: torch.Tensor,
+        resident_block_table: torch.Tensor,
+        dram_block_table: torch.Tensor,
+        num_reqs: int,
+    ) -> DSAOffloadSelectionOutput:
+        """shared indexer 层的 decode 选择：复用所属 full 层的 LIDU 输出。
+
+        不跑 LIDU（shared 层无 indexer 权重），只对本层 resident/DRAM
+        arena 跑 KSC。新鲜度守卫确保所属 full 层在本步已先跑过 LIDU。
+        """
+        if self.indexer_cache is not None or self.selection_source_layer_id is None:
+            raise RuntimeError(
+                "DSA full-indexer layer must use execute_decode_selection: "
+                f"layer_id={self.layer_id}"
+            )
+        if self.runtime._selection_source_layer != self.selection_source_layer_id:
+            raise RuntimeError(
+                "DSA shared-indexer selection source is stale: "
+                f"layer_id={self.layer_id}, "
+                f"expected_source={self.selection_source_layer_id}, "
+                f"current_source={self.runtime._selection_source_layer}, "
+                f"epoch={self.runtime._selection_epoch}"
+            )
+        outputs = self.runtime.get_lidu_outputs(num_reqs=int(num_reqs))
         store = self.runtime.dram_store
         if store is None:
             raise RuntimeError("DSA layer has no bound DRAM store")

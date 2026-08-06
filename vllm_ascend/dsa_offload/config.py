@@ -315,6 +315,20 @@ class DSAOffloadConfig:
                 "DSA offload model dimensions do not match the current "
                 f"LIDU/KSC/SFA-Offload ABI: {mismatched}"
             )
+        if capabilities.has_shared_indexer_layers:
+            hf_text_config = getattr(vllm_config.model_config, "hf_text_config", None)
+            num_hidden_layers = getattr(hf_text_config, "num_hidden_layers", None)
+            if num_hidden_layers is None or len(capabilities.indexer_types) != num_hidden_layers:
+                raise ValueError(
+                    "DSA shared-indexer topology must declare one indexer type "
+                    f"per hidden layer: indexer_types={len(capabilities.indexer_types)}, "
+                    f"num_hidden_layers={num_hidden_layers!r}"
+                )
+            if not capabilities.full_indexer_layer_indices:
+                raise ValueError(
+                    "DSA shared-indexer topology requires at least one full "
+                    "indexer layer to source top-K selection"
+                )
         scheduler_config = vllm_config.scheduler_config
         cache_config = vllm_config.cache_config
         parallel_config = vllm_config.parallel_config

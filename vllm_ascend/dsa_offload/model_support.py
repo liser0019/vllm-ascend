@@ -42,6 +42,22 @@ def _positive_int_or_none(value: Any) -> int | None:
     return parsed if parsed > 0 else None
 
 
+def _indexer_types_or_none(value: Any) -> tuple[str, ...] | None:
+    """归一化 HF config 的 indexer_types（如 GLM-5.2 的 full/shared 列表）。
+
+    只在确为字符串序列时返回小写元组，否则视为未声明（全 full 拓扑），
+    以免把异常配置误当作共享 indexer。
+    """
+    if not isinstance(value, (list, tuple)):
+        return None
+    lowered: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            return None
+        lowered.append(item.lower())
+    return tuple(lowered)
+
+
 @dataclass(frozen=True)
 class DSAOffloadModelCapabilities:
     """DSA offload 从已解析模型配置中提取出的稳定能力描述。"""
@@ -54,6 +70,9 @@ class DSAOffloadModelCapabilities:
     index_num_heads: int | None
     kv_lora_rank: int | None
     qk_rope_head_dim: int | None
+    # 共享 indexer 拓扑（GLM-5.2）。None 表示未声明 → 每层独立 indexer。
+    indexer_types: tuple[str, ...] | None = None
+    index_topk_freq: int | None = None
 
     @property
     def missing_requirements(self) -> tuple[str, ...]:
@@ -77,6 +96,28 @@ class DSAOffloadModelCapabilities:
     @property
     def supported(self) -> bool:
         return not self.missing_requirements
+
+    @property
+    def has_shared_indexer_layers(self) -> bool:
+        """是否存在复用他层 top-K 的 shared indexer 层（GLM-5.2 拓扑）。"""
+        return (
+            self.indexer_types is not None
+            and any(t == "shared" for t in self.indexer_types)
+        )
+
+    @property
+    def full_indexer_layer_indices(self) -> tuple[int, ...] | None:
+        """声明为 full（建独立 indexer）的 transformer 层下标；未声明拓扑时为 None。"""
+        if self.indexer_types is None:
+            return None
+        return tuple(i for i, t in enumerate(self.indexer_types) if t == "full")
+
+    @property
+    def shared_indexer_layer_indices(self) -> tuple[int, ...] | None:
+        """声明为 shared（复用所属 full 层 top-K）的层下标；未声明拓扑时为 None。"""
+        if self.indexer_types is None:
+            return None
+        return tuple(i for i, t in enumerate(self.indexer_types) if t == "shared")
 
 
 def get_dsa_offload_model_capabilities(
@@ -105,6 +146,8 @@ def get_dsa_offload_model_capabilities(
         index_num_heads=_positive_int_or_none(getattr(hf_text_config, "index_n_heads", None)),
         kv_lora_rank=_positive_int_or_none(getattr(hf_text_config, "kv_lora_rank", None)),
         qk_rope_head_dim=_positive_int_or_none(getattr(hf_text_config, "qk_rope_head_dim", None)),
+        indexer_types=_indexer_types_or_none(getattr(hf_text_config, "indexer_types", None)),
+        index_topk_freq=_positive_int_or_none(getattr(hf_text_config, "index_topk_freq", None)),
     )
 
 
