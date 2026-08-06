@@ -489,11 +489,13 @@ class TestNPUWorker(TestBase):
             self.assertTrue(worker.pin_lora(2))
             mock_model_runner.pin_lora.assert_called_once_with(2)
 
-    def test_get_methods(self):
+    @patch("vllm_ascend.worker.worker.get_ascend_config")
+    def test_get_methods(self, mock_get_ascend_config):
         """Test various get methods"""
         from vllm_ascend.worker.worker import NPUWorker
 
         # Create worker mock
+        mock_get_ascend_config.return_value.sparse_kv_offload_config.enabled = False
         with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
             worker = NPUWorker()
             mock_model_runner = MagicMock()
@@ -539,6 +541,7 @@ class TestNPUWorker(TestBase):
                 skip_gdn_state_update=True,
             )
 
+    @patch("vllm_ascend.worker.worker.get_ascend_config")
     @patch("vllm_ascend.worker.worker.memory_profiling")
     @patch("torch.npu.reset_peak_memory_stats")
     @patch("torch.npu.empty_cache")
@@ -553,6 +556,7 @@ class TestNPUWorker(TestBase):
         mock_torch_empty_cache,
         mock_torch_reset_peak_memory_stats,
         mock_memory_profiling,
+        mock_get_ascend_config,
     ):
         """Test determine_available_memory normal case (no non-torch memory allocation)"""
         from vllm_ascend.worker.worker import NPUWorker
@@ -571,6 +575,7 @@ class TestNPUWorker(TestBase):
         mock_context.__enter__ = MagicMock(return_value=mock_profile_result)
         mock_context.__exit__ = MagicMock(return_value=False)
         mock_memory_profiling.return_value = mock_context
+        mock_get_ascend_config.return_value.sparse_kv_offload_config.enabled = False
 
         # Mock init_snapshot
         mock_init_snapshot = MagicMock()
@@ -602,6 +607,7 @@ class TestNPUWorker(TestBase):
             expected_result = int(10000 * 0.8 - 3500)
             self.assertEqual(result, expected_result)
 
+    @patch("vllm_ascend.worker.worker.get_ascend_config")
     @patch("vllm_ascend.worker.worker.memory_profiling")
     @patch("torch.npu.reset_peak_memory_stats")
     @patch("torch.npu.empty_cache")
@@ -614,6 +620,7 @@ class TestNPUWorker(TestBase):
         mock_torch_empty_cache,
         mock_torch_reset_peak_memory_stats,
         mock_memory_profiling,
+        mock_get_ascend_config,
     ):
         """Test determine_available_memory with significant non-torch memory allocation"""
         from vllm_ascend.worker.worker import NPUWorker
@@ -632,6 +639,7 @@ class TestNPUWorker(TestBase):
         mock_context.__enter__ = MagicMock(return_value=mock_profile_result)
         mock_context.__exit__ = MagicMock(return_value=False)
         mock_memory_profiling.return_value = mock_context
+        mock_get_ascend_config.return_value.sparse_kv_offload_config.enabled = False
 
         # Mock init_snapshot
         mock_init_snapshot = MagicMock()
@@ -704,6 +712,7 @@ class TestNPUWorker(TestBase):
 
             self.assertIn("Error in memory profiling", str(cm.exception))
 
+    @patch("vllm_ascend.worker.worker.get_ascend_config")
     @patch("vllm_ascend.worker.worker.memory_profiling")
     @patch("torch.npu.reset_peak_memory_stats")
     @patch("torch.npu.empty_cache")
@@ -716,6 +725,7 @@ class TestNPUWorker(TestBase):
         mock_torch_empty_cache,
         mock_torch_reset_peak_memory_stats,
         mock_memory_profiling,
+        mock_get_ascend_config,
     ):
         """Test determine_available_memory returns 0 when result is negative"""
         from vllm_ascend.worker.worker import NPUWorker
@@ -734,6 +744,7 @@ class TestNPUWorker(TestBase):
         mock_context.__enter__ = MagicMock(return_value=mock_profile_result)
         mock_context.__exit__ = MagicMock(return_value=False)
         mock_memory_profiling.return_value = mock_context
+        mock_get_ascend_config.return_value.sparse_kv_offload_config.enabled = False
 
         # Mock init_snapshot
         mock_init_snapshot = MagicMock()
