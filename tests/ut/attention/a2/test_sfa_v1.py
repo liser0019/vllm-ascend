@@ -111,6 +111,81 @@ class TestAscendSFABytePackedGather(TestBase):
             )
 
 
+class TestAscendSFAOffloadBinding(TestBase):
+    @staticmethod
+    def _make_impl(*, has_indexer: bool, skip_topk: bool, layer_index: int) -> AscendSFAImpl:
+        impl = AscendSFAImpl.__new__(AscendSFAImpl)
+        impl.dsa_offload_context = None
+        impl.enable_sparse_sfa_c8 = False
+        impl.enable_sparse_li_c8 = False
+        impl.has_indexer = has_indexer
+        impl.skip_topk = skip_topk
+        impl.layer_name = f"model.layers.{layer_index}.self_attn.attn"
+        return impl
+
+    def test_full_context_binds_with_local_indexer(self):
+        impl = self._make_impl(
+            has_indexer=True,
+            skip_topk=False,
+            layer_index=1,
+        )
+        context = SimpleNamespace(indexer_cache=torch.empty(1))
+
+        impl.bind_dsa_offload_context(context)
+
+        self.assertIs(impl.dsa_offload_context, context)
+
+    def test_local_indexer_skip_topk_is_rejected_at_bind(self):
+        impl = self._make_impl(
+            has_indexer=True,
+            skip_topk=True,
+            layer_index=1,
+        )
+        context = SimpleNamespace(indexer_cache=torch.empty(1))
+
+        with self.assertRaisesRegex(RuntimeError, "runtime IndexCache layers"):
+            impl.bind_dsa_offload_context(context)
+
+    @patch("vllm_ascend.attention.sfa_v1.get_ascend_config")
+    def test_shared_context_requires_current_layer_to_be_declared_shared(self, mock_get_ascend_config):
+        mock_get_ascend_config.return_value = SimpleNamespace(
+            dsa_offload_config=SimpleNamespace(
+                model_capabilities=SimpleNamespace(
+                    shared_indexer_layer_indices=(2,),
+                )
+            )
+        )
+        impl = self._make_impl(
+            has_indexer=False,
+            skip_topk=True,
+            layer_index=1,
+        )
+        context = SimpleNamespace(indexer_cache=None)
+
+        with self.assertRaisesRegex(RuntimeError, "declared shared-indexer topology"):
+            impl.bind_dsa_offload_context(context)
+
+    @patch("vllm_ascend.attention.sfa_v1.get_ascend_config")
+    def test_declared_shared_context_binds_without_local_indexer(self, mock_get_ascend_config):
+        mock_get_ascend_config.return_value = SimpleNamespace(
+            dsa_offload_config=SimpleNamespace(
+                model_capabilities=SimpleNamespace(
+                    shared_indexer_layer_indices=(1,),
+                )
+            )
+        )
+        impl = self._make_impl(
+            has_indexer=False,
+            skip_topk=True,
+            layer_index=1,
+        )
+        context = SimpleNamespace(indexer_cache=None)
+
+        impl.bind_dsa_offload_context(context)
+
+        self.assertIs(impl.dsa_offload_context, context)
+
+
 class TestAscendSFADeviceOperator(TestBase):
     def _make_common_inputs(self):
         ql_nope = torch.randn(3, 4, 8)

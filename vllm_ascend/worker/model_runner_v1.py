@@ -5722,6 +5722,7 @@ class NPUModelRunner(GPUModelRunner):
         from vllm.model_executor.models.deepseek_v2 import (
             DeepseekV32IndexerCache,
         )
+        from vllm.model_executor.models.utils import extract_layer_index
 
         kv_cache_spec: dict[str, list[KVCacheSpec]] = defaultdict(list)
         attn_layers = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
@@ -5774,6 +5775,26 @@ class NPUModelRunner(GPUModelRunner):
                                 "is not yet available. Disable sparse LI C8 for "
                                 f"offload. layer={layer_name}"
                             )
+                        skip_topk = bool(getattr(impl, "skip_topk", False))
+                        caps = self.ascend_config.dsa_offload_config.model_capabilities
+                        shared_indices = (
+                            caps.shared_indexer_layer_indices
+                            if caps is not None
+                            else None
+                        )
+                        layer_index = extract_layer_index(layer_name)
+                        declared_shared = bool(
+                            shared_indices is not None
+                            and layer_index in shared_indices
+                        )
+                        if has_indexer and skip_topk:
+                            raise RuntimeError(
+                                "DSA sparse offload does not support runtime "
+                                "IndexCache layers that keep a local Indexer "
+                                "while skip_topk is enabled; only checkpoint-"
+                                "declared shared layers without a local Indexer "
+                                f"may reuse LIDU output. layer={layer_name}"
+                            )
                         if not has_indexer:
                             # GLM-5.2 shared indexer 层不建本层 indexer，
                             # 复用所属 full 层 top-K，以 skip_topk 标识。
@@ -5781,11 +5802,6 @@ class NPUModelRunner(GPUModelRunner):
                             # 时才放行；未声明拓扑的模型（如 DeepSeek 用
                             # index_topk_freq/pattern 造出的 skip_topk 层）
                             # 缺 indexer 仍属配置/加载错误，不进入共享复用路径。
-                            skip_topk = bool(getattr(impl, "skip_topk", False))
-                            caps = self.ascend_config.dsa_offload_config.model_capabilities
-                            declared_shared = bool(
-                                caps is not None and caps.has_shared_indexer_layers
-                            )
                             if not (skip_topk and declared_shared):
                                 raise RuntimeError(
                                     "DSA sparse offload requires one independent "

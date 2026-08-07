@@ -394,9 +394,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             else None
         )
         dsa_row_modes = (
-            common_attn_metadata.dsa_row_modes[:num_reqs]
-            if common_attn_metadata.dsa_row_modes is not None
-            else None
+            common_attn_metadata.dsa_row_modes[:num_reqs] if common_attn_metadata.dsa_row_modes is not None else None
         )
         dsa_resident_pool_indices = (
             common_attn_metadata.dsa_resident_pool_indices[:num_reqs]
@@ -770,9 +768,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         """绑定由 model runner 初始化的一份逐层 DSA 稳定资源。"""
 
         if self.dsa_offload_context is not None:
-            raise RuntimeError(
-                f"DSA offload context for {self.layer_name} was bound twice"
-            )
+            raise RuntimeError(f"DSA offload context for {self.layer_name} was bound twice")
         if self.enable_sparse_sfa_c8:
             raise RuntimeError(
                 "DSA sparse offload does not support SFA C8 packed resident "
@@ -793,13 +789,24 @@ class AscendSFAImpl(MLAAttentionImpl):
         if context.indexer_cache is not None:
             if not self.has_indexer:
                 raise RuntimeError(
-                    "DSA full-indexer context bound to a layer without a "
-                    f"local indexer: layer={self.layer_name}"
+                    f"DSA full-indexer context bound to a layer without a local indexer: layer={self.layer_name}"
+                )
+            if self.skip_topk:
+                raise RuntimeError(
+                    "DSA offload does not support runtime IndexCache layers "
+                    "that keep a local Indexer while skip_topk is enabled; "
+                    "only checkpoint-declared shared layers without a local "
+                    f"Indexer may reuse LIDU output. layer={self.layer_name}"
                 )
         else:
+            from vllm.model_executor.models.utils import extract_layer_index
+
             caps = get_ascend_config().dsa_offload_config.model_capabilities
+            layer_index = extract_layer_index(self.layer_name) if self.layer_name is not None else -1
             declared_shared = bool(
-                caps is not None and caps.has_shared_indexer_layers
+                caps is not None
+                and caps.shared_indexer_layer_indices is not None
+                and layer_index in caps.shared_indexer_layer_indices
             )
             if not (self.skip_topk and not self.has_indexer and declared_shared):
                 raise RuntimeError(
@@ -1634,8 +1641,9 @@ class AscendSFAImpl(MLAAttentionImpl):
             q_li, q_li_scale = torch_npu.npu_dynamic_quant(q_li.view(-1, self.head_dim), dst_type=self.c8_k_cache_dtype)
             q_li_scale = q_li_scale.to(self.c8_k_scale_cache_dtype)  # [b*s,]
 
-        # prefetch 门在 forward 的 skip_topk 分支前统一记录，覆盖无本层
-        # indexer 的 shared 层。
+        # full Indexer 层在完成 query/indexer 投影后打开 prefetch 门；shared
+        # 层没有这一步，因此在 forward 的 skip_topk 分支单独记录。
+        record_attention_compute_start()
         dsa_context = self.dsa_offload_context
         if dsa_context is not None:
             if q_li_scale is not None or self.enable_sparse_li_c8:
@@ -1645,29 +1653,17 @@ class AscendSFAImpl(MLAAttentionImpl):
                 )
             indexer_block_table = attn_metadata.dsa_indexer_block_table
             if indexer_block_table is None:
-                raise RuntimeError(
-                    "DSA attention metadata is missing the Indexer block table"
-                )
+                raise RuntimeError("DSA attention metadata is missing the Indexer block table")
 
             if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
                 if len(kv_cache) < 2:
-                    raise RuntimeError(
-                        "DSA resident MLA cache must contain NOPE and ROPE "
-                        "planes"
-                    )
+                    raise RuntimeError("DSA resident MLA cache must contain NOPE and ROPE planes")
                 row_modes = attn_metadata.dsa_row_modes
-                resident_pool_indices = (
-                    attn_metadata.dsa_resident_pool_indices
-                )
+                resident_pool_indices = attn_metadata.dsa_resident_pool_indices
                 dram_block_table = attn_metadata.dsa_dram_block_table
-                if (
-                    row_modes is None
-                    or resident_pool_indices is None
-                    or dram_block_table is None
-                ):
+                if row_modes is None or resident_pool_indices is None or dram_block_table is None:
                     raise RuntimeError(
-                        "DSA decode metadata is missing row mode, resident "
-                        "pool index, or DRAM block table"
+                        "DSA decode metadata is missing row mode, resident pool index, or DRAM block table"
                     )
                 return dsa_context.execute_decode_selection(
                     query=q_li,
@@ -1699,21 +1695,17 @@ class AscendSFAImpl(MLAAttentionImpl):
                     sparse_mode=3,
                 )
             else:
-                topk_indices, _ = (
-                    torch.ops._C_ascend.npu_lightning_indexer(
-                        query=q_li,
-                        key=dsa_context.indexer_cache,
-                        weights=weights,
-                        actual_seq_lengths_query=(
-                            actual_seq_lengths_query
-                        ),
-                        actual_seq_lengths_key=actual_seq_lengths_key,
-                        block_table=indexer_block_table,
-                        layout_query="TND",
-                        layout_key="PA_BSND",
-                        sparse_count=2048,
-                        sparse_mode=3,
-                    )
+                topk_indices, _ = torch.ops._C_ascend.npu_lightning_indexer(
+                    query=q_li,
+                    key=dsa_context.indexer_cache,
+                    weights=weights,
+                    actual_seq_lengths_query=(actual_seq_lengths_query),
+                    actual_seq_lengths_key=actual_seq_lengths_key,
+                    block_table=indexer_block_table,
+                    layout_query="TND",
+                    layout_key="PA_BSND",
+                    sparse_count=2048,
+                    sparse_mode=3,
                 )
             return topk_indices
 
@@ -1757,14 +1749,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         if isinstance(topk_indices, DSAOffloadSelectionOutput):
             dsa_context = self.dsa_offload_context
             if dsa_context is None:
-                raise RuntimeError(
-                    "DSA selection output has no bound layer context"
-                )
+                raise RuntimeError("DSA selection output has no bound layer context")
             if len(kv_cache) < 2:
-                raise RuntimeError(
-                    "DSA resident MLA cache must contain NOPE and ROPE "
-                    "planes"
-                )
+                raise RuntimeError("DSA resident MLA cache must contain NOPE and ROPE planes")
             return dsa_context.execute_sparse_attention(
                 query=ql_nope,
                 resident_nope_cache=kv_cache[0],
@@ -2085,23 +2072,16 @@ class AscendSFAImpl(MLAAttentionImpl):
             assert k_li is not None
             dsa_context = self.dsa_offload_context
             if dsa_context is not None:
-                indexer_slot_mapping = (
-                    attn_metadata.dsa_indexer_slot_mapping
-                )
+                indexer_slot_mapping = attn_metadata.dsa_indexer_slot_mapping
                 if indexer_slot_mapping is None:
-                    raise RuntimeError(
-                        "DSA Indexer cache write is missing its independent "
-                        "slot mapping"
-                    )
+                    raise RuntimeError("DSA Indexer cache write is missing its independent slot mapping")
                 num_actual_tokens = attn_metadata.num_actual_tokens
                 torch_npu.npu_scatter_nd_update_(
                     dsa_context.indexer_cache.view(
                         -1,
                         k_li.shape[-1],
                     ),
-                    indexer_slot_mapping[
-                        :num_actual_tokens
-                    ].view(-1, 1),
+                    indexer_slot_mapping[:num_actual_tokens].view(-1, 1),
                     k_li[:num_actual_tokens].view(
                         -1,
                         k_li.shape[-1],
@@ -2134,9 +2114,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         k_li.view(-1, k_li.shape[-1]),
                     )  # b, s, n, d
                 if self.enable_sparse_li_c8:
-                    assert len(kv_cache) == (
-                        3 if self.enable_sparse_sfa_c8 else 4
-                    )
+                    assert len(kv_cache) == (3 if self.enable_sparse_sfa_c8 else 4)
                     if k_li_scale is not None:
                         if get_ascend_config().c8_enable_reshape_optim:
                             torch.ops._C_ascend.store_kv_block(
@@ -2149,9 +2127,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                             )
                         else:
                             torch_npu.npu_scatter_nd_update_(
-                                kv_cache[
-                                    dsa_k_scale_cache_idx
-                                ].view(
+                                kv_cache[dsa_k_scale_cache_idx].view(
                                     -1,
                                     k_li_scale.shape[-1],
                                 ),
@@ -2171,20 +2147,15 @@ class AscendSFAImpl(MLAAttentionImpl):
         else:
             topk_num_tokens = num_input_tokens or hidden_states.shape[0]
 
-        # 为每个 SFA 层打开 prefetch 门。GLM-5.2 的 shared 层复用缓存的
-        # top-K、没有本层 indexer，若在 indexer_select_post_process 内记录
-        # 会让它们的门一直关着。
-        record_attention_compute_start()
-
         if self.skip_topk:
+            # shared/IndexCache 层不执行 indexer_select_post_process，需要在
+            # 读取缓存选择结果前独立打开本层 prefetch 门。
+            record_attention_compute_start()
             # shared indexer 层：DSA decode 下复用所属 full 层的 LIDU 输出
             # （仅对本层 arena 跑 KSC）；其余（prefill/mixed/非 DSA）仍走
             # 原生 buffer 路径，读 full 层刚 stash 的 token 级 top-K。
             dsa_context = self.dsa_offload_context
-            if (
-                dsa_context is not None
-                and attn_metadata.attn_state == AscendAttentionState.DecodeOnly
-            ):
+            if dsa_context is not None and attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
                 if kv_cache is None or len(kv_cache) < 2:
                     raise RuntimeError(
                         "DSA shared-indexer decode requires resident NOPE and "
@@ -2193,10 +2164,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 dram_block_table = attn_metadata.dsa_dram_block_table
                 row_modes = attn_metadata.dsa_row_modes
                 if dram_block_table is None or row_modes is None:
-                    raise RuntimeError(
-                        "DSA shared-indexer decode metadata is missing DRAM "
-                        "block table or row modes"
-                    )
+                    raise RuntimeError("DSA shared-indexer decode metadata is missing DRAM block table or row modes")
                 topk_indices = dsa_context.execute_shared_decode_selection(
                     resident_nope_cache=kv_cache[0],
                     resident_rope_cache=kv_cache[1],
@@ -2234,10 +2202,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
         if self.dsa_offload_context is not None:
             if kv_cache is None or len(kv_cache) < 2:
-                raise RuntimeError(
-                    "DSA full-block dump requires resident NOPE and ROPE "
-                    "cache planes"
-                )
+                raise RuntimeError("DSA full-block dump requires resident NOPE and ROPE cache planes")
             # 当前 DSA 只使用单 stream：本层 SFA 完成后再 dump，下一
             # step 的 LIDU/KSC 才会消费该 DRAM block，因此无需额外完成
             # 状态。若后续引入异步多流 dump，必须增加事件和可见性状态。

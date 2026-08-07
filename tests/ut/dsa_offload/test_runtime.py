@@ -80,10 +80,7 @@ def test_lidu_scratch_is_shared_but_cache_slots_remain_per_layer() -> None:
     assert first is second
     assert first.topk_index.data_ptr() == runtime._lidu_topk_index.data_ptr()
     assert first.topk_slots.data_ptr() == runtime._lidu_topk_slots.data_ptr()
-    assert (
-        resident_pool.get_cache_slots(0).data_ptr()
-        != resident_pool.get_cache_slots(1).data_ptr()
-    )
+    assert resident_pool.get_cache_slots(0).data_ptr() != resident_pool.get_cache_slots(1).data_ptr()
 
 
 def _register_layer_arenas(store: DSAHotDRAMStore, num_layers: int = 2) -> None:
@@ -257,96 +254,6 @@ def test_full_layer_rejects_shared_path() -> None:
         )
 
 
-def _c8_full_context(layer_id: int, runtime: DSAOffloadRuntime) -> DSALayerOffloadContext:
-    return DSALayerOffloadContext(
-        layer_id=layer_id,
-        indexer_cache=torch.zeros((2, 4, 128), dtype=torch.int8),
-        runtime=runtime,
-        selection_source_layer_id=None,
-        indexer_scale_cache=torch.zeros((2, 4, 1), dtype=torch.float16),
-    )
-
-
-def test_c8_full_layer_dispatches_to_quant_lidu_and_raises() -> None:
-    # C8 context 的 decode 选择应路由到 quant LIDU 变体；算子未实现 → 拦截报错。
-    resident_pool, runtime, store = _make_runtime()
-    _register_layer_arenas(store)
-    ctx = _c8_full_context(layer_id=0, runtime=runtime)
-    with pytest.raises(NotImplementedError, match="quantized LIDU"):
-        ctx.execute_decode_selection(
-            query=torch.zeros((1, 32, 128), dtype=torch.int8),
-            weights=torch.zeros((1, 32), dtype=torch.bfloat16),
-            row_modes=torch.zeros((1,), dtype=torch.int32),
-            resident_pool_indices=torch.zeros((1,), dtype=torch.int32),
-            actual_seq_lengths_key=torch.ones((1,), dtype=torch.int32),
-            indexer_block_table=torch.zeros((1, 4), dtype=torch.int32),
-            resident_nope_cache=torch.zeros((2, 4, 8), dtype=torch.bfloat16),
-            resident_rope_cache=torch.zeros((2, 4, 8), dtype=torch.bfloat16),
-            resident_block_table=torch.zeros((1, 4), dtype=torch.int32),
-            dram_block_table=torch.zeros((1, 4), dtype=torch.int32),
-            query_scale=torch.zeros((1,), dtype=torch.float16),
-        )
-
-
-def test_c8_full_layer_requires_query_scale() -> None:
-    # C8 context 缺 query_scale 应在调 quant LIDU 前明确报错。
-    resident_pool, runtime, store = _make_runtime()
-    _register_layer_arenas(store)
-    ctx = _c8_full_context(layer_id=0, runtime=runtime)
-    with pytest.raises(RuntimeError, match="quantized query scale"):
-        ctx.execute_decode_selection(
-            query=torch.zeros((1, 32, 128), dtype=torch.int8),
-            weights=torch.zeros((1, 32), dtype=torch.bfloat16),
-            row_modes=torch.zeros((1,), dtype=torch.int32),
-            resident_pool_indices=torch.zeros((1,), dtype=torch.int32),
-            actual_seq_lengths_key=torch.ones((1,), dtype=torch.int32),
-            indexer_block_table=torch.zeros((1, 4), dtype=torch.int32),
-            resident_nope_cache=torch.zeros((2, 4, 8), dtype=torch.bfloat16),
-            resident_rope_cache=torch.zeros((2, 4, 8), dtype=torch.bfloat16),
-            resident_block_table=torch.zeros((1, 4), dtype=torch.int32),
-            dram_block_table=torch.zeros((1, 4), dtype=torch.int32),
-        )
-
-
-def test_bf16_full_layer_ignores_quant_dispatch(monkeypatch) -> None:
-    # bf16 context（indexer_scale_cache=None）仍走原 LIDU，不触碰 quant 变体。
-    resident_pool, runtime, store = _make_runtime()
-    _register_layer_arenas(store)
-    bf16_lidu: list[dict] = []
-
-    def _boom(**kw):  # quant 变体不应被调用
-        raise AssertionError("quant LIDU must not run for bf16 indexer")
-
-    monkeypatch.setattr(
-        "vllm_ascend.dsa_offload.runtime.lightning_indexer_decode_update",
-        lambda **kw: bf16_lidu.append(kw),
-    )
-    monkeypatch.setattr(
-        "vllm_ascend.dsa_offload.runtime.lightning_indexer_decode_update_quant",
-        _boom,
-    )
-    monkeypatch.setattr(
-        "vllm_ascend.dsa_offload.runtime.kvcache_scatter_copy",
-        lambda **kw: None,
-    )
-
-    ctx = _full_context(layer_id=0, runtime=runtime)
-    ctx.execute_decode_selection(
-        query=torch.zeros((1, 32, 128), dtype=torch.bfloat16),
-        weights=torch.zeros((1, 32), dtype=torch.bfloat16),
-        row_modes=torch.zeros((1,), dtype=torch.int32),
-        resident_pool_indices=torch.zeros((1,), dtype=torch.int32),
-        actual_seq_lengths_key=torch.ones((1,), dtype=torch.int32),
-        indexer_block_table=torch.zeros((1, 4), dtype=torch.int32),
-        resident_nope_cache=torch.zeros((2, 4, 8), dtype=torch.bfloat16),
-        resident_rope_cache=torch.zeros((2, 4, 8), dtype=torch.bfloat16),
-        resident_block_table=torch.zeros((1, 4), dtype=torch.int32),
-        dram_block_table=torch.zeros((1, 4), dtype=torch.int32),
-    )
-
-    assert bf16_lidu, "bf16 层应走原 LIDU 路径"
-
-
 def test_dump_plan_is_compact_and_idempotent() -> None:
     resident_pool, runtime, store = _make_runtime()
     state = DSAInputBatchCacheLayout(
@@ -460,9 +367,7 @@ def test_consecutive_prefill_chunks_dump_only_newly_completed_blocks() -> None:
 
     assert runtime.dump_job_count == 1
     assert runtime.dump_src_block_ids.np[0] == 12
-    assert store.logical_block_table[0, :2].tolist() == (
-        first_two_dram_blocks.tolist()
-    )
+    assert store.logical_block_table[0, :2].tolist() == (first_two_dram_blocks.tolist())
     assert store.logical_block_table[0, 2] != 0
 
 
@@ -485,9 +390,7 @@ def test_enter_rejects_missing_dram_source_blocks() -> None:
         input_batch=input_batch,
         projection=DSARequestCacheLayoutProjection(
             request_ids=("req-0",),
-            stages=(
-                int(DSARequestCacheStage.ENTER_SPARSE_DECODE),
-            ),
+            stages=(int(DSARequestCacheStage.ENTER_SPARSE_DECODE),),
             target_resident_budget_tokens=(256,),
             sparse_budget_tokens=(256,),
             resident_valid_tokens=(257,),
@@ -566,12 +469,8 @@ def test_graph_capture_runtime_can_be_reused_for_multiple_sizes() -> None:
         assert runtime.active_num_reqs == row_count
         assert runtime.execution_num_reqs == row_count
         assert runtime.dump_launch_count == row_count
-        assert runtime.active_dram_block_table.gpu[
-            :row_count
-        ].eq(0).all()
-        assert runtime.dump_dst_block_ids.gpu[
-            :row_count
-        ].eq(-1).all()
+        assert runtime.active_dram_block_table.gpu[:row_count].eq(0).all()
+        assert runtime.dump_dst_block_ids.gpu[:row_count].eq(-1).all()
 
         runtime.restore_after_graph_capture()
 

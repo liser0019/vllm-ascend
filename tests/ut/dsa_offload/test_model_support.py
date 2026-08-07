@@ -114,9 +114,7 @@ def test_shared_indexer_topology_is_parsed() -> None:
 
 
 def test_all_full_topology_is_default_and_not_shared() -> None:
-    capabilities = get_dsa_offload_model_capabilities(
-        _model_config("DeepseekV32ForCausalLM")
-    )
+    capabilities = get_dsa_offload_model_capabilities(_model_config("DeepseekV32ForCausalLM"))
 
     assert capabilities.supported
     assert not capabilities.has_shared_indexer_layers
@@ -125,14 +123,20 @@ def test_all_full_topology_is_default_and_not_shared() -> None:
     assert capabilities.index_topk_freq is None
 
 
-def test_malformed_indexer_types_falls_back_to_all_full() -> None:
+def test_malformed_indexer_types_is_rejected() -> None:
     config = _model_config("GlmMoeDsaForCausalLM")
     config.hf_text_config.indexer_types = ["full", 128, "shared"]  # 非全字符串
 
-    capabilities = get_dsa_offload_model_capabilities(config)
+    with pytest.raises(ValueError, match="entries must be strings"):
+        get_dsa_offload_model_capabilities(config)
 
-    assert capabilities.indexer_types is None
-    assert not capabilities.has_shared_indexer_layers
+
+def test_unknown_indexer_type_is_rejected() -> None:
+    config = _model_config("GlmMoeDsaForCausalLM")
+    config.hf_text_config.indexer_types = ["full", "reuse"]
+
+    with pytest.raises(ValueError, match="must be 'full' or 'shared'"):
+        get_dsa_offload_model_capabilities(config)
 
 
 def test_undeclared_topk_freq_topology_is_not_treated_as_shared() -> None:

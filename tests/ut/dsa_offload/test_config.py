@@ -74,11 +74,7 @@ def _vllm_config(
         compilation_config=SimpleNamespace(
             mode=compilation_mode,
             cudagraph_mode=cudagraph_mode,
-            cudagraph_capture_sizes=(
-                []
-                if cudagraph_capture_sizes is None
-                else cudagraph_capture_sizes
-            ),
+            cudagraph_capture_sizes=([] if cudagraph_capture_sizes is None else cudagraph_capture_sizes),
         ),
     )
 
@@ -106,6 +102,30 @@ def test_enabled_config_keeps_fractional_dram_multiplier() -> None:
     assert config.hot_cpu_block_multiple == 1.5
     assert config.model_capabilities is not None
     assert config.model_capabilities.architecture == "GlmMoeDsaForCausalLM"
+
+
+def test_declared_all_full_topology_still_validates_layer_count() -> None:
+    vllm_config = _vllm_config()
+    vllm_config.model_config.hf_text_config.indexer_types = ["full", "full"]
+    vllm_config.model_config.hf_text_config.num_hidden_layers = 3
+
+    with pytest.raises(ValueError, match="one indexer type per hidden layer"):
+        DSAOffloadConfig.from_dict(
+            {"enabled": True},
+            vllm_config=vllm_config,
+        )
+
+
+def test_shared_topology_rejects_layer_without_preceding_full_source() -> None:
+    vllm_config = _vllm_config()
+    vllm_config.model_config.hf_text_config.indexer_types = ["shared", "full"]
+    vllm_config.model_config.hf_text_config.num_hidden_layers = 2
+
+    with pytest.raises(ValueError, match="follow a full source layer"):
+        DSAOffloadConfig.from_dict(
+            {"enabled": True},
+            vllm_config=vllm_config,
+        )
 
 
 def test_enabled_config_rejects_non_split_layout() -> None:

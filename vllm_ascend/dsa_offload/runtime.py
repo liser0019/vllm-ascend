@@ -38,7 +38,6 @@ from vllm_ascend.dsa_offload.ops import (
     dump_full_kv_cache_blocks,
     kvcache_scatter_copy,
     lightning_indexer_decode_update,
-    lightning_indexer_decode_update_quant,
     sparse_flash_attention_for_offload,
 )
 from vllm_ascend.dsa_offload.request_cache_layout import (
@@ -120,9 +119,7 @@ class DSAOffloadRuntime:
             dtype=torch.int32,
             device=self.device,
         )
-        self._token_sparse_budgets = torch.empty_like(
-            self._token_row_modes
-        )
+        self._token_sparse_budgets = torch.empty_like(self._token_row_modes)
         self._sparse_token_mask = torch.empty(
             self.max_num_tokens,
             dtype=torch.bool,
@@ -136,14 +133,9 @@ class DSAOffloadRuntime:
             device=self.device,
             pin_memory=pin_memory,
         )
-        self.active_dram_block_table.np.fill(
-            DSA_DRAM_NULL_BLOCK_ID
-        )
+        self.active_dram_block_table.np.fill(DSA_DRAM_NULL_BLOCK_ID)
         self.active_dram_block_table.gpu.zero_()
-        max_dump_jobs = (
-            cdiv(self.max_num_tokens, self.block_size)
-            + self.max_num_reqs
-        )
+        max_dump_jobs = cdiv(self.max_num_tokens, self.block_size) + self.max_num_reqs
         self.dump_src_block_ids = CpuGpuBuffer(
             max_dump_jobs,
             dtype=torch.int32,
@@ -157,13 +149,9 @@ class DSAOffloadRuntime:
             pin_memory=pin_memory,
         )
         self.dump_src_block_ids.np.fill(0)
-        self.dump_dst_block_ids.np.fill(
-            DSA_DUMP_NOOP_DST_BLOCK_ID
-        )
+        self.dump_dst_block_ids.np.fill(DSA_DUMP_NOOP_DST_BLOCK_ID)
         self.dump_src_block_ids.gpu.zero_()
-        self.dump_dst_block_ids.gpu.fill_(
-            DSA_DUMP_NOOP_DST_BLOCK_ID
-        )
+        self.dump_dst_block_ids.gpu.fill_(DSA_DUMP_NOOP_DST_BLOCK_ID)
         self._dump_pool_indices = np.empty(max_dump_jobs, dtype=np.intp)
         self._dump_logical_indices = np.empty(max_dump_jobs, dtype=np.intp)
         self._dump_source_blocks = np.empty(max_dump_jobs, dtype=np.int32)
@@ -178,21 +166,11 @@ class DSAOffloadRuntime:
             self.max_num_reqs,
             dtype=np.int64,
         )
-        self._computed_tokens_i64 = np.empty_like(
-            self._scheduled_tokens_i64
-        )
-        self._tokens_after_schedule = np.empty_like(
-            self._scheduled_tokens_i64
-        )
-        self._first_logical_blocks = np.empty_like(
-            self._scheduled_tokens_i64
-        )
-        self._completed_after_blocks = np.empty_like(
-            self._scheduled_tokens_i64
-        )
-        self._completed_block_counts = np.empty_like(
-            self._scheduled_tokens_i64
-        )
+        self._computed_tokens_i64 = np.empty_like(self._scheduled_tokens_i64)
+        self._tokens_after_schedule = np.empty_like(self._scheduled_tokens_i64)
+        self._first_logical_blocks = np.empty_like(self._scheduled_tokens_i64)
+        self._completed_after_blocks = np.empty_like(self._scheduled_tokens_i64)
+        self._completed_block_counts = np.empty_like(self._scheduled_tokens_i64)
         self._dump_boundary_mask = np.empty(
             self.max_num_reqs,
             dtype=np.bool_,
@@ -261,10 +239,7 @@ class DSAOffloadRuntime:
                 f"num_reqs={num_reqs}"
             )
         if num_tokens > self.max_num_tokens:
-            raise RuntimeError(
-                f"DSA token capacity exceeded: {num_tokens} > "
-                f"{self.max_num_tokens}"
-            )
+            raise RuntimeError(f"DSA token capacity exceeded: {num_tokens} > {self.max_num_tokens}")
 
         # 六列共用一个 owner，仅一次 H2D；后续 tensor 均为该 owner 的 view。
         state.copy_to_device(num_reqs)
@@ -342,9 +317,7 @@ class DSAOffloadRuntime:
         """
 
         if self._graph_capture_row_count:
-            raise RuntimeError(
-                "DSA real execution cannot reuse an active capture dummy"
-            )
+            raise RuntimeError("DSA real execution cannot reuse an active capture dummy")
         active_num_reqs = int(active_num_reqs)
         if active_num_reqs != self.active_num_reqs:
             raise RuntimeError(
@@ -358,11 +331,7 @@ class DSAOffloadRuntime:
             launch_count = self.dump_job_count
         else:
             execution_num_reqs = int(graph_row_count)
-            if not (
-                active_num_reqs
-                <= execution_num_reqs
-                <= self.max_num_reqs
-            ):
+            if not (active_num_reqs <= execution_num_reqs <= self.max_num_reqs):
                 raise RuntimeError(
                     "DSA graph rows must cover active rows and fit runtime "
                     f"capacity: active={active_num_reqs}, "
@@ -379,9 +348,7 @@ class DSAOffloadRuntime:
             if self.dump_job_count < launch_count:
                 tail = slice(self.dump_job_count, launch_count)
                 self.dump_src_block_ids.np[tail] = 0
-                self.dump_dst_block_ids.np[tail] = (
-                    DSA_DUMP_NOOP_DST_BLOCK_ID
-                )
+                self.dump_dst_block_ids.np[tail] = DSA_DUMP_NOOP_DST_BLOCK_ID
 
         if launch_count:
             self.dump_src_block_ids.gpu[:launch_count].copy_(
@@ -401,14 +368,10 @@ class DSAOffloadRuntime:
         """为原生 dummy-run 安装固定地址 DRAM/dump 输入。"""
 
         if self.dram_store is None:
-            raise RuntimeError(
-                "DSA graph capture requires an initialized DRAM store"
-            )
+            raise RuntimeError("DSA graph capture requires an initialized DRAM store")
         row_count = int(row_count)
         if self._graph_capture_row_count:
-            raise RuntimeError(
-                "DSA runtime graph-capture state was installed twice"
-            )
+            raise RuntimeError("DSA runtime graph-capture state was installed twice")
         if not 0 < row_count <= self.max_num_reqs:
             raise ValueError(
                 "DSA runtime graph-capture row count is outside capacity: "
@@ -417,18 +380,12 @@ class DSAOffloadRuntime:
 
         self._graph_capture_row_count = row_count
         try:
-            self.active_dram_block_table.np[:row_count].fill(
-                DSA_DRAM_NULL_BLOCK_ID
-            )
+            self.active_dram_block_table.np[:row_count].fill(DSA_DRAM_NULL_BLOCK_ID)
             self.active_dram_block_table.gpu[:row_count].zero_()
             self.dump_src_block_ids.np[:row_count] = 0
-            self.dump_dst_block_ids.np[:row_count] = (
-                DSA_DUMP_NOOP_DST_BLOCK_ID
-            )
+            self.dump_dst_block_ids.np[:row_count] = DSA_DUMP_NOOP_DST_BLOCK_ID
             self.dump_src_block_ids.gpu[:row_count].zero_()
-            self.dump_dst_block_ids.gpu[:row_count].fill_(
-                DSA_DUMP_NOOP_DST_BLOCK_ID
-            )
+            self.dump_dst_block_ids.gpu[:row_count].fill_(DSA_DUMP_NOOP_DST_BLOCK_ID)
             self.active_num_reqs = row_count
             self.execution_num_reqs = row_count
             self.dump_job_count = 0
@@ -530,23 +487,16 @@ class DSAOffloadRuntime:
                 )
 
             jobs = slice(job_count, next_job_count)
-            self._dump_pool_indices[jobs] = (
-                state.resident_pool_indices_cpu[row]
-            )
-            self._dump_logical_indices[jobs] = self._logical_block_indices[
-                logical_start:logical_end
-            ]
+            self._dump_pool_indices[jobs] = state.resident_pool_indices_cpu[row]
+            self._dump_logical_indices[jobs] = self._logical_block_indices[logical_start:logical_end]
             if state.row_modes_cpu[row] == DSA_ROW_MODE_SPARSE:
                 if count != 1:
                     raise RuntimeError(
-                        "DSA sparse decode completed more than one full "
-                        f"block in one step: row={row}, count={count}"
+                        f"DSA sparse decode completed more than one full block in one step: row={row}, count={count}"
                     )
                 tail_column = int(resident_row_widths[row]) - 1
                 if tail_column < 0:
-                    raise RuntimeError(
-                        f"DSA sparse row {row} has no resident tail block"
-                    )
+                    raise RuntimeError(f"DSA sparse row {row} has no resident tail block")
                 self._dump_source_blocks[jobs] = resident_blocks[
                     row,
                     tail_column,
@@ -601,29 +551,19 @@ class DSAOffloadRuntime:
         if signature == self._dram_table_signature:
             return False
         previous_row_count = self._dram_table_row_count
-        active_cpu = self.active_dram_block_table.np[
-            : self.active_num_reqs
-        ]
+        active_cpu = self.active_dram_block_table.np[: self.active_num_reqs]
         store.gather_rows(
-            pool_indices=state.resident_pool_indices_cpu[
-                : self.active_num_reqs
-            ],
+            pool_indices=state.resident_pool_indices_cpu[: self.active_num_reqs],
             output=active_cpu,
         )
         if self.active_num_reqs < previous_row_count:
-            self.active_dram_block_table.np[
-                self.active_num_reqs:previous_row_count
-            ].fill(DSA_DRAM_NULL_BLOCK_ID)
+            self.active_dram_block_table.np[self.active_num_reqs : previous_row_count].fill(DSA_DRAM_NULL_BLOCK_ID)
         copy_row_count = max(
             self.active_num_reqs,
             previous_row_count,
         )
-        self.active_dram_block_table.gpu[
-            :copy_row_count
-        ].copy_(
-            self.active_dram_block_table.cpu[
-                :copy_row_count
-            ],
+        self.active_dram_block_table.gpu[:copy_row_count].copy_(
+            self.active_dram_block_table.cpu[:copy_row_count],
             non_blocking=True,
         )
         self._dram_table_row_count = self.active_num_reqs
@@ -648,17 +588,9 @@ class DSAOffloadRuntime:
         num_reqs = self.active_num_reqs
         stages = state.stages_cpu[:num_reqs]
         if validate_all_sparse:
-            rows = np.flatnonzero(
-                stages >= int(
-                    DSARequestCacheStage.ENTER_SPARSE_DECODE
-                )
-            )
+            rows = np.flatnonzero(stages >= int(DSARequestCacheStage.ENTER_SPARSE_DECODE))
         else:
-            rows = np.flatnonzero(
-                stages == int(
-                    DSARequestCacheStage.ENTER_SPARSE_DECODE
-                )
-            )
+            rows = np.flatnonzero(stages == int(DSARequestCacheStage.ENTER_SPARSE_DECODE))
         if rows.size == 0:
             return
 
@@ -667,16 +599,10 @@ class DSAOffloadRuntime:
             row = int(row_value)
             # LIDU 把最后一个非空块作为 dense tail；只有它之前的完整块
             # 会成为 KSC 的 DRAM source。
-            required_blocks = (
-                max(0, int(self._tokens_after_schedule[row]) - 1)
-                // self.block_size
-            )
+            required_blocks = max(0, int(self._tokens_after_schedule[row]) - 1) // self.block_size
             if required_blocks == 0:
                 continue
-            missing = np.flatnonzero(
-                dram_table[row, :required_blocks]
-                == DSA_DRAM_NULL_BLOCK_ID
-            )
+            missing = np.flatnonzero(dram_table[row, :required_blocks] == DSA_DRAM_NULL_BLOCK_ID)
             if missing.size:
                 request_id = input_batch.req_ids[row]
                 raise RuntimeError(
@@ -698,9 +624,7 @@ class DSAOffloadRuntime:
         view = self._lidu_output_views.get(num_reqs)
         if view is None:
             if not 0 < num_reqs <= self.max_num_reqs:
-                raise RuntimeError(
-                    f"DSA LIDU row count {num_reqs} is outside capacity"
-                )
+                raise RuntimeError(f"DSA LIDU row count {num_reqs} is outside capacity")
             view = DSALightningIndexerOutputs(
                 topk_index=self._lidu_topk_index[:num_reqs],
                 topk_slots=self._lidu_topk_slots[:num_reqs],
@@ -719,15 +643,14 @@ class DSALayerOffloadContext:
     为 None）；GLM-5.2 的 shared indexer 层 ``indexer_cache`` 为 None，
     用 ``selection_source_layer_id`` 指向所属 full 层，复用其 LIDU 输出。
 
-    ``indexer_scale_cache`` 为 None 表示 bf16/fp16 indexer；非 None（C8
-    量化，int8 K + fp16 scale）时本层走 quant LIDU 变体。
+    当前 context 只接受 bf16/fp16 Indexer。C8 必须等量化 LIDU、独立
+    K/scale 分配与 reshape、写入和 prefill/decode 合同完整后再接入。
     """
 
     layer_id: int
     indexer_cache: torch.Tensor | None
     runtime: DSAOffloadRuntime
     selection_source_layer_id: int | None = None
-    indexer_scale_cache: torch.Tensor | None = None
 
     def execute_decode_selection(
         self,
@@ -742,53 +665,24 @@ class DSALayerOffloadContext:
         resident_rope_cache: torch.Tensor,
         resident_block_table: torch.Tensor,
         dram_block_table: torch.Tensor,
-        query_scale: torch.Tensor | None = None,
     ) -> DSAOffloadSelectionOutput:
         if self.indexer_cache is None:
-            raise RuntimeError(
-                "DSA shared-indexer layer must not run LIDU selection: "
-                f"layer_id={self.layer_id}"
-            )
+            raise RuntimeError(f"DSA shared-indexer layer must not run LIDU selection: layer_id={self.layer_id}")
         num_reqs = int(query.shape[0])
         outputs = self.runtime.get_lidu_outputs(
             num_reqs=num_reqs,
         )
-        if self.indexer_scale_cache is not None:
-            # C8 量化 Indexer：走 quant LIDU 变体（当前未实现 → 报错拦截）。
-            if query_scale is None:
-                raise RuntimeError(
-                    "DSA C8 Indexer decode requires a quantized query scale: "
-                    f"layer_id={self.layer_id}"
-                )
-            lightning_indexer_decode_update_quant(
-                query=query,
-                query_scale=query_scale,
-                key=self.indexer_cache,
-                key_scale=self.indexer_scale_cache,
-                weights=weights,
-                req_pool_entries=resident_pool_indices,
-                cache_slots=self.runtime.resident_token_pool.get_cache_slots(
-                    self.layer_id
-                ),
-                row_modes=row_modes,
-                actual_seq_lengths_key=actual_seq_lengths_key,
-                block_table=indexer_block_table,
-                outputs=outputs,
-            )
-        else:
-            lightning_indexer_decode_update(
-                query=query,
-                key=self.indexer_cache,
-                weights=weights,
-                req_pool_entries=resident_pool_indices,
-                cache_slots=self.runtime.resident_token_pool.get_cache_slots(
-                    self.layer_id
-                ),
-                row_modes=row_modes,
-                actual_seq_lengths_key=actual_seq_lengths_key,
-                block_table=indexer_block_table,
-                outputs=outputs,
-            )
+        lightning_indexer_decode_update(
+            query=query,
+            key=self.indexer_cache,
+            weights=weights,
+            req_pool_entries=resident_pool_indices,
+            cache_slots=self.runtime.resident_token_pool.get_cache_slots(self.layer_id),
+            row_modes=row_modes,
+            actual_seq_lengths_key=actual_seq_lengths_key,
+            block_table=indexer_block_table,
+            outputs=outputs,
+        )
         # 记录本步 full 层选择来源，供其 shared 跟随层复用前校验。
         self.runtime._selection_source_layer = self.layer_id
         store = self.runtime.dram_store
@@ -826,10 +720,7 @@ class DSALayerOffloadContext:
         arena 跑 KSC。新鲜度守卫确保所属 full 层在本步已先跑过 LIDU。
         """
         if self.indexer_cache is not None or self.selection_source_layer_id is None:
-            raise RuntimeError(
-                "DSA full-indexer layer must use execute_decode_selection: "
-                f"layer_id={self.layer_id}"
-            )
+            raise RuntimeError(f"DSA full-indexer layer must use execute_decode_selection: layer_id={self.layer_id}")
         if self.runtime._selection_source_layer != self.selection_source_layer_id:
             raise RuntimeError(
                 "DSA shared-indexer selection source is stale: "

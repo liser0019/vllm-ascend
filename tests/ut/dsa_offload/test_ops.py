@@ -2,36 +2,7 @@
 
 import torch
 
-from vllm_ascend.dsa_offload.ops import (
-    DSALightningIndexerOutputs,
-    _normalize_lidu_weights_layout,
-    lightning_indexer_decode_update_quant,
-)
-
-import pytest
-
-
-def test_lidu_quant_variant_raises_until_operator_lands() -> None:
-    outputs = DSALightningIndexerOutputs(
-        topk_index=torch.zeros((1, 1, 16), dtype=torch.int32),
-        topk_slots=torch.zeros((1, 1, 16), dtype=torch.int32),
-        miss_count=torch.zeros((1,), dtype=torch.int32),
-        tail_info=torch.zeros((1, 2), dtype=torch.int32),
-    )
-    with pytest.raises(NotImplementedError, match="quantized LIDU"):
-        lightning_indexer_decode_update_quant(
-            query=torch.zeros((1, 32, 128), dtype=torch.int8),
-            query_scale=torch.zeros((1,), dtype=torch.float16),
-            key=torch.zeros((2, 4, 128), dtype=torch.int8),
-            key_scale=torch.zeros((2, 4, 1), dtype=torch.float16),
-            weights=torch.zeros((1, 32), dtype=torch.bfloat16),
-            req_pool_entries=torch.zeros((1,), dtype=torch.int32),
-            cache_slots=torch.zeros((2, 16), dtype=torch.int32),
-            row_modes=torch.zeros((1,), dtype=torch.int32),
-            actual_seq_lengths_key=torch.ones((1,), dtype=torch.int32),
-            block_table=torch.zeros((1, 4), dtype=torch.int32),
-            outputs=outputs,
-        )
+from vllm_ascend.dsa_offload.ops import _normalize_lidu_weights_layout
 
 
 def test_lidu_weights_normalizes_fused_projection_suffix_view() -> None:

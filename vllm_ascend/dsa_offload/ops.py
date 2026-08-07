@@ -41,16 +41,9 @@ _REQUIRED_OPS = (
 def require_dsa_offload_ops() -> None:
     """在 worker 初始化期确认四个设备算子均已部署。"""
 
-    missing = [
-        op_name
-        for op_name in _REQUIRED_OPS
-        if not hasattr(torch.ops._C_ascend, op_name)
-    ]
+    missing = [op_name for op_name in _REQUIRED_OPS if not hasattr(torch.ops._C_ascend, op_name)]
     if missing:
-        raise RuntimeError(
-            "DSA sparse offload custom operators are not installed: "
-            f"{tuple(missing)}"
-        )
+        raise RuntimeError(f"DSA sparse offload custom operators are not installed: {tuple(missing)}")
 
 
 def _squeeze_cache_head_dim(
@@ -62,10 +55,7 @@ def _squeeze_cache_head_dim(
         return cache.squeeze(2)
     if cache.ndim == 3:
         return cache
-    raise ValueError(
-        f"{name} must be [blocks, block, 1, dim] or "
-        f"[blocks, block, dim], got {tuple(cache.shape)}"
-    )
+    raise ValueError(f"{name} must be [blocks, block, 1, dim] or [blocks, block, dim], got {tuple(cache.shape)}")
 
 
 def _normalize_lidu_weights_layout(weights: torch.Tensor) -> torch.Tensor:
@@ -108,35 +98,6 @@ def lightning_indexer_decode_update(
         outputs.topk_slots,
         outputs.miss_count,
         outputs.tail_info,
-    )
-
-
-def lightning_indexer_decode_update_quant(
-    *,
-    query: torch.Tensor,
-    query_scale: torch.Tensor,
-    key: torch.Tensor,
-    key_scale: torch.Tensor,
-    weights: torch.Tensor,
-    req_pool_entries: torch.Tensor,
-    cache_slots: torch.Tensor,
-    row_modes: torch.Tensor,
-    actual_seq_lengths_key: torch.Tensor,
-    block_table: torch.Tensor,
-    outputs: DSALightningIndexerOutputs,
-) -> None:
-    """C8 量化 Indexer cache 的 LIDU 变体（int8 K + fp16 scale，query 亦量化）。
-
-    TODO(遗留事项): 接受 int8 key + fp16 key_scale + int8 query + query_scale
-    的 AscendC quant LIDU 算子（目标名
-    ``npu_lightning_indexer_decode_update_quant_out``）尚未实现，本接口仅为
-    后续接入预留。当前 dense 路径的 ``npu_lightning_indexer_quant`` 不维护
-    DSA 逐层 resident slot 状态，不能直接替代。
-    """
-    raise NotImplementedError(
-        "DSA C8 Indexer offload requires a quantized LIDU AscendC operator "
-        "(npu_lightning_indexer_decode_update_quant_out) that is not yet "
-        "implemented. See DSA-offload-GLM5.2适配.md 遗留事项."
     )
 
 

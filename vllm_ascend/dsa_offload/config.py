@@ -312,10 +312,9 @@ class DSAOffloadConfig:
             }
         if mismatched:
             raise ValueError(
-                "DSA offload model dimensions do not match the current "
-                f"LIDU/KSC/SFA-Offload ABI: {mismatched}"
+                f"DSA offload model dimensions do not match the current LIDU/KSC/SFA-Offload ABI: {mismatched}"
             )
-        if capabilities.has_shared_indexer_layers:
+        if capabilities.indexer_types is not None:
             hf_text_config = getattr(vllm_config.model_config, "hf_text_config", None)
             num_hidden_layers = getattr(hf_text_config, "num_hidden_layers", None)
             if num_hidden_layers is None or len(capabilities.indexer_types) != num_hidden_layers:
@@ -324,10 +323,18 @@ class DSAOffloadConfig:
                     f"per hidden layer: indexer_types={len(capabilities.indexer_types)}, "
                     f"num_hidden_layers={num_hidden_layers!r}"
                 )
+        if capabilities.has_shared_indexer_layers:
             if not capabilities.full_indexer_layer_indices:
                 raise ValueError(
-                    "DSA shared-indexer topology requires at least one full "
-                    "indexer layer to source top-K selection"
+                    "DSA shared-indexer topology requires at least one full indexer layer to source top-K selection"
+                )
+            first_shared = capabilities.shared_indexer_layer_indices[0]
+            first_full = capabilities.full_indexer_layer_indices[0]
+            if first_shared < first_full:
+                raise ValueError(
+                    "DSA shared-indexer topology requires every shared layer "
+                    "to follow a full source layer: "
+                    f"first_shared={first_shared}, first_full={first_full}"
                 )
         scheduler_config = vllm_config.scheduler_config
         cache_config = vllm_config.cache_config
@@ -345,13 +352,9 @@ class DSAOffloadConfig:
         if scheduler_config.async_scheduling is not False:
             raise ValueError("DSA sparse offload currently requires async_scheduling=False")
         chunked_prefill_enabled = (
-            bool(scheduler_config.enable_chunked_prefill)
-            or int(scheduler_config.long_prefill_token_threshold or 0) > 0
+            bool(scheduler_config.enable_chunked_prefill) or int(scheduler_config.long_prefill_token_threshold or 0) > 0
         )
-        if (
-            chunked_prefill_enabled
-            and not bool(scheduler_config.scheduler_reserve_full_isl)
-        ):
+        if chunked_prefill_enabled and not bool(scheduler_config.scheduler_reserve_full_isl):
             raise ValueError(
                 "DSA chunked prefill requires scheduler_reserve_full_isl=True "
                 "so the complete prompt can be admitted into both dense "
@@ -446,10 +449,7 @@ class DSAOffloadConfig:
                     "with FULL decode graphs after Ascend normalization: "
                     f"phase={phase}, cudagraph_mode={cudagraph_mode}"
                 )
-            if (
-                require_resolved_mode
-                and not cudagraph_mode.separate_routine()
-            ):
+            if require_resolved_mode and not cudagraph_mode.separate_routine():
                 raise ValueError(
                     "DSA row-mode decode graph requires a separate FULL "
                     "decode routine (for example FULL_DECODE_ONLY), rather "

@@ -1,7 +1,7 @@
 # DSA 稀疏卸载 GLM5.2 适配计划
 
 > - 最后更新：2026-08-06
-> - 当前阶段：**Phase 1 共享 indexer 适配完成；Phase 2 C8 接口 + 拦截落地（算子为遗留事项，C8 配置即报错不进入）**
+> - 当前阶段：**Phase 1 共享 indexer 适配完成；Phase 2 C8 仅保留 fail-fast（完整数据面为遗留事项）**
 > - 适配目标：只修改 vLLM-Ascend，不修改 vLLM
 
 ## 1. 文档职责
@@ -13,7 +13,6 @@
 - 新旧基线的关键差异；
 - 各迁移阶段的优先级、设计约束、验收门槛和当前状态；
 
-
 每完成一个阶段，都必须同步更新本文档的状态表、验收结果和变更记录。
 
 ## 2. 基线与目录
@@ -22,16 +21,13 @@
 |---|---|---|
 | DSA 特性（GLM5.1 版） | 本仓库 `vllm-ascend-v0.23.0-custom` 分支 | `6af99b372`（DSA 稀疏卸载落地末端） |
 | 目标基线 | 本仓库 `official/main`（detached HEAD） | `9a52ca5fc`（已含 layerwise prefill offload / MTP / sparse C8） |
-| 目标模型 | GLM-5.2 W4A4C8-mxfp4 | HF `zai-org/GLM-5.2`（实测 config 见 §3） |
+| 目标模型 | GLM-5.2 W4A4-mxfp4（bf16/fp16 Indexer） | HF `zai-org/GLM-5.2`（实测 config 见 §3；Indexer C8 尚未支持） |
 
 > 说明：`dsa_offload/` 模块当前不在工作区（HEAD 已切到 `official/main`），
 > 下文对 DSA 侧的引用均按 `git show 6af99b372:<path>` 读取的行号。
 
-
-
-
-
 ## 代码的疑问
+
 1. 分成两个group 之后，tensor buffer物理空间是否会共享
 2. mla中如何使用两个group
 3. PREFILL/DENSE/ENTER/SPARSE 分别是什么？
@@ -73,6 +69,7 @@ shared 层：其余 57 层             （不建独立 Indexer，复用最近 fu
 ```
 
 **两个「先按假设走 / 不确定」的确定答案：**
+
 - 维度 → **全部落在 DSA ABI 内**，LIDU/KSC/SFA 算子**不用重调**。
 - 共享 indexer → **确实存在且激进（57/78 层 shared）**，是适配的**核心结构性改动**。
 
@@ -93,6 +90,7 @@ DSA 数据面假设「每层都跑 LIDU、每层有独立 indexer_cache」。GLM
 | `runtime` LIDU scratch + `resident_pool.cache_slots`（每层） | 每层跑 LIDU、每层一套 cache_slots | shared 层不跑 LIDU、复用 full 层 top-K | 78 层全建属浪费且语义错 |
 
 改造方向：
+
 - **plane 规划**：只给 21 个 `full` 层建 Indexer plane；校验放宽为「indexer 数 == full 层数」。
 - **绑定**：shared 层的 `DSALayerOffloadContext.indexer_cache` 指向所属 full 层 cache。
 - **数据面**：shared 层跳过 LIDU，复用所属 full 层的 `topk_index/topk_slots`，只跑 KSC + SFA-Offload；LIDU scratch 与 `cache_slots` 只对 full 层建。
@@ -101,7 +99,7 @@ DSA 数据面假设「每层都跑 LIDU、每层有独立 indexer_cache」。GLM
   `patch_deepseek_v2.py:40-56` 处理共享 indexer 前向，但那是 eager 非 offload 路径；
   DSA 的 plane 规划 / 绑定 / 算子链需自行对齐。
 
-### ② Indexer C8 int8 —— 接口已备 + 拦截（算子为遗留事项）
+### ② Indexer C8 int8 —— 仅 fail-fast（完整数据面为遗留事项）
 
 - 互斥性 ✅：与主 cache `enable_sparse_sfa_c8` 互斥，与 offload 的 `enable_sparse_li_c8`
   方向不冲突（indexer 驻留设备、不被卸载）。
@@ -109,20 +107,15 @@ DSA 数据面假设「每层都跑 LIDU、每层有独立 indexer_cache」。GLM
   **fp16/bf16** 单 dense key（C++ dtype 门 `lightning_indexer_decode_update_torch_adpt.h:78-82`），
   **无 int8/fp8、无 scale 入参**；dense 路径虽有 `npu_lightning_indexer_quant`，但它不维护
   DSA 逐层 resident slot 状态，不能替代。→ 需要**新的 quant LIDU AscendC 算子**。
-- **当前策略（用户定）**：写好接口，实现处遇 C8 **报错不进入**，算子实现留作遗留事项。已落地：
-  - `DSAIndexerC8KVSpec(DSAIndexerKVSpec)`（`kv_cache.py`）：`real_page_size_bytes` 拆
-    int8 K + fp16 scale；scale 用类级常量（`merge` 只重建基类字段，不能加实例字段）。
-  - `ops.py::lightning_indexer_decode_update_quant(...)`：接口签名齐全（int8 K + fp16
-    key_scale + int8 q + query_scale），函数体 `raise NotImplementedError`（目标算子名
-    `npu_lightning_indexer_decode_update_quant_out`）；**不进** `_REQUIRED_OPS`。
-  - `runtime.py`：`DSALayerOffloadContext.indexer_scale_cache` 可选字段 + `execute_decode_selection`
-    按 `indexer_scale_cache is not None` 分发到 quant 变体（缺 query_scale 先报错）。
-  - **三处拦截（遇 C8 报错不进入）**：`bind_dsa_offload_context`、`get_kv_cache_spec` spec
-    发射门、`indexer_select_post_process`，均对 `enable_sparse_li_c8` 抛 `NotImplementedError`
-    并指向本遗留事项；`enable_sparse_sfa_c8` 维持原有 bf16-only 拒绝。
-- 待算子落地后补齐：indexer 写入侧 `npu_dynamic_quant`（复用 `sfa_v1.py` c8 写法）、reshape
-  拆 (K, scale)（`model_runner_v1.py:5126-5152` 当前只产单 dense tensor）、bind 接受 tuple、
-  prefill 切 `npu_lightning_indexer_quant`。范围仍只动 21 个 full 层 Indexer plane。
+- **当前策略**：遇 C8 **启动期报错不进入**。不保留无法贯通 allocator/reshape/bind/write/decode
+  的半成品 spec 或 runtime dispatch，避免未来误解除单个拦截后把 K+scale 字节错误 reshape 成
+  单个 dense tensor。
+- **三处拦截**：`bind_dsa_offload_context`、`get_kv_cache_spec` spec 发射门、
+  `indexer_select_post_process` 均对 `enable_sparse_li_c8` 抛 `NotImplementedError`；
+  `enable_sparse_sfa_c8` 继续维持 resident MLA bf16-only 拒绝。
+- 待完整接入：实现 quant LIDU AscendC 算子，同时补齐设备相关 K/scale dtype、容量 spec、
+  独立分配与 reshape、bind tuple、indexer 写入量化、prefill quant LI、decode query scale 和真机测试。
+  这些必须作为一个可运行合同一次性落地，范围仍只覆盖 21 个 full 层 Indexer plane。
 
 ### ③ 量化 W4A4-mxfp4 —— 几乎零改动
 
@@ -171,13 +164,14 @@ if use_sparse and has_indexer_cache and current_sparse_li_c8:
 | **SFA C8**（`enable_sparse_sfa_c8`） | 主 MLA → int8/fp8 packed | **int8/fp8** | ⚠️ 变 | 是（且与 offload 互斥） |
 
 结论：
+
 - **权重量化（W4A4/W4A8/W8A8/FP8/mxfp4）只压权重+激活，KV cache 全程 bf16**，
   被搬的 MLA 数据字节布局一字节不变，对卸载/加载**完全透明**。
 - **只有 KV cache 量化那一小类**（FAKQuant 的 `fa_quant_type`、SFA 的
   `enable_sparse_sfa_c8`）才改 MLA cache dtype、才需动搬运数据面（DRAM arena 加
   scale、dump/KSC 带 scale、容量重算）。
-- 本适配目标 = **W4A4-mxfp4（权重量化）+ Indexer C8（压不被搬的 indexer）**，
-  两者都不改变被搬的 MLA resident cache，故**卸载/加载这条通路零适配**。
+- 当前可运行目标是 **W4A4-mxfp4 权重量化 + bf16/fp16 Indexer**；权重量化不改变被搬的
+  MLA resident cache，故卸载/加载通路零适配。Indexer C8 仍为显式未支持组合。
 - 注：`enable_sparse_sfa_c8`（MLA int8）与 sparse offload **本就互斥**
   （`ascend_config.py:299-306`），「MLA int8 + offload」组合当前被显式拒绝，
   不在本适配范围。
@@ -219,43 +213,38 @@ if use_sparse and has_indexer_cache and current_sparse_li_c8:
   不别名 cache_slots 行（`resident_pool` 78 行字节不变，57 个 shared 行为死行）、不复制副本；
   `runtime_layer_id` 仍按 78 个 resident 层稠密编号，仅 LIDU 输入（indexer_cache / cache_slots
   行）为 full 层独有。改动点：
-  - `model_support.py`：加 `indexer_types/index_topk_freq` 能力字段 + `has_shared_indexer_layers`/
+    - `model_support.py`：加 `indexer_types/index_topk_freq` 能力字段 + `has_shared_indexer_layers`/
     `full|shared_indexer_layer_indices` 派生（`supported` 判定不变）。
-  - `config.py`：`_validate_runtime_contract` 加 shared 拓扑交叉检查（indexer_types 长度 ==
+    - `config.py`：`_validate_runtime_contract` 加 shared 拓扑交叉检查（indexer_types 长度 ==
     num_hidden_layers 且至少一个 full 层）。
-  - `kv_cache.py`：`build_dsa_kv_cache_groups` 把「indexer 数==resident 数」放宽为「indexer 数
+    - `kv_cache.py`：`build_dsa_kv_cache_groups` 把「indexer 数==resident 数」放宽为「indexer 数
     ≤ resident 数 + transformer 下标子集检查」（orphan indexer 仍硬失败）。
-  - `model_runner_v1.py`：`get_kv_cache_spec` 对 `has_indexer=False 且 skip_topk=True` 的 shared
+    - `model_runner_v1.py`：`get_kv_cache_spec` 对 `has_indexer=False 且 skip_topk=True` 的 shared
     层放行发射 resident spec（其余缺 indexer 仍报错，C8 拒绝保留）；`_bind_dsa_split_kv_caches`
     plane 集合改子集语义、循环跟踪 `last_full_layer` 为 shared 层设 `selection_source_layer_id`、
     加 indexer 数与声明拓扑一致性交叉检查。
-  - `runtime.py`：`DSALayerOffloadContext.indexer_cache` 改可选 + 新增 `selection_source_layer_id`；
+    - `runtime.py`：`DSALayerOffloadContext.indexer_cache` 改可选 + 新增 `selection_source_layer_id`；
     新增 `execute_shared_decode_selection`（不跑 LIDU，用本层 arena + 复用源 full 层 LIDU 输出跑
     KSC）；epoch 守卫在 `prepare_forward`/`prepare_execution_view`/`prepare_graph_capture` 三处
     每步入口重置。
-  - `sfa_v1.py`：`bind_dsa_offload_context` 删 `use_index_cache` raise、改 context/impl 拓扑一致性
+    - `sfa_v1.py`：`bind_dsa_offload_context` 删 `use_index_cache` raise、改 context/impl 拓扑一致性
     校验；`forward` skip_topk 分支加 DSA decode 分流（shared 走 `execute_shared_decode_selection`，
     其余仍走原生 buffer 路径）；stash 门加 `isinstance(topk_indices, torch.Tensor)`；
     `record_attention_compute_start()` 从 `indexer_select_post_process` 移到 forward（覆盖无本层
     indexer 的 shared 层）。
-  - `resident_pool.py`：仅补 shared 死行不变量注释，行为不变。
+    - `resident_pool.py`：仅补 shared 死行不变量注释，行为不变。
   UT：改写 `test_kv_cache.py` 组校验测试（21/78 混合通过、orphan/more-indexer 失败）、
   `test_model_support.py` 补 GLM-5.2 拓扑派生、`test_runtime.py` 补 shared 选择/守卫/误路由测试。
   本地无 torch/vllm，AST 全过；pytest 与 E2E 待 Ascend 机器执行。
-  **对 all-full 模型（DeepSeek-V3.2/GLM-5.1）每步均为 no-op**（不声明拓扑 → 全部守卫/校验跳过）。
-- 2026-08-06：**Phase 2 C8 接口 + 拦截落地（用户定：无 LIDU C8 算子，算子留作遗留事项，
-  C8 配置即报错不进入）**。核实：LIDU 仅 fp16/bf16 单 dense key、无 scale/int8；需新 quant
-  LIDU AscendC 算子。落地 `DSAIndexerC8KVSpec`（page-bytes 拆 int8 K + fp16 scale，类级常量保
-  merge 无损）、`ops.lightning_indexer_decode_update_quant`（接口齐全、函数体 raise
-  NotImplementedError，目标算子名 `npu_lightning_indexer_decode_update_quant_out`，不进
-  `_REQUIRED_OPS`）、`runtime` 加 `indexer_scale_cache` 可选字段 + decode 分发。三处拦截
-  （bind / spec 发射门 / indexer_select_post_process）对 `enable_sparse_li_c8` 抛
-  NotImplementedError 指向遗留事项；`enable_sparse_sfa_c8` 维持原 bf16-only 拒绝。bf16 路径
-  字节不变。UT：C8 spec page-bytes/merge 保真/isinstance 归入、quant LIDU raise、C8 dispatch
-  拦截、bf16 不走 quant 分支。
-  **遗留事项**：实现 `npu_lightning_indexer_decode_update_quant_out`（int8 K + fp16 key_scale
-  + int8 q + query_scale 的 quant LIDU AscendC 算子）后，再补 indexer 写入量化、reshape 拆
-  (K, scale)、bind 接受 tuple、prefill 切 quant 读，并解除三处拦截。
+  **对未启用 runtime IndexCache 的 all-full 模型（DeepSeek-V3.2/GLM-5.1）每步均为 no-op**；
+  保留本层 Indexer 且 `skip_topk=True` 的 runtime IndexCache 组合继续启动期拒绝，避免 decode 误入
+  checkpoint-shared 路径。
+- 2026-08-07：对抗审查后将 Phase 2 收敛为纯 fail-fast。移除未接入 allocator/reshape/bind/write
+  的 C8 spec、quant LIDU 占位函数和 runtime 虚假 dispatch；保留三处启动期拦截。Indexer C8
+  后续必须以完整数据面和真机证据一次性接入，不能通过解除单个 `NotImplementedError` 启用。
+- 2026-08-07：修复 runtime IndexCache 回归。只有 `indexer_types` 对当前层明确声明 `shared`、
+  `skip_topk=True` 且无本层 Indexer 时才进入共享 LIDU 复用；保留本层 Indexer 的 skip_topk
+  配置在 spec/bind 阶段明确拒绝。KV group 无条件校验 Indexer 层下标为 resident 子集。
 - 2026-08-06：**提交前对抗评审（5 维度 + 3 视角核实）修复 3 项**：
   1. **GLM-5.2 拓扑更正**：以 HF `zai-org/GLM-5.2` config.json 为准，实为 **21 full / 57 shared**
      （full 在 0,1,2 后每隔 4 层一个，6..74），全文 20/58 → 21/57 更正；`test_model_support.py`

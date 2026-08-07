@@ -13,9 +13,11 @@ Adapt Hugging Face or local models to run on `vllm-ascend` with minimal changes,
 
 1. Start with `references/workflow-checklist.md`.
 2. Read `references/multimodal-ep-aclgraph-lessons.md` (feature-first checklist).
-3. If startup/inference fails, read `references/troubleshooting.md`.
-4. If checkpoint is fp8-on-NPU, read `references/fp8-on-npu-lessons.md`.
-5. Before handoff, read `references/deliverables.md`.
+3. For DSA sparse attention, shared Indexer, IndexCache, or KV offload work, read
+   `references/shared-indexer-offload-lessons.md`.
+4. If startup/inference fails, read `references/troubleshooting.md`.
+5. If checkpoint is fp8-on-NPU, read `references/fp8-on-npu-lessons.md`.
+6. Before handoff, read `references/deliverables.md`.
 
 ## Hard constraints
 

@@ -45,16 +45,26 @@ def _positive_int_or_none(value: Any) -> int | None:
 def _indexer_types_or_none(value: Any) -> tuple[str, ...] | None:
     """归一化 HF config 的 indexer_types（如 GLM-5.2 的 full/shared 列表）。
 
-    只在确为字符串序列时返回小写元组，否则视为未声明（全 full 拓扑），
-    以免把异常配置误当作共享 indexer。
+    ``None`` 表示模型未声明拓扑，沿用每层独立 Indexer。只要模型显式提供
+    该字段，就必须完整且只包含 ``full``/``shared``，避免异常配置被静默
+    降级成 all-full 后在权重加载或绑定阶段才失败。
     """
-    if not isinstance(value, (list, tuple)):
+    if value is None:
         return None
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(
+            f"DSA indexer_types must be a sequence containing only 'full'/'shared', got {type(value).__name__}"
+        )
     lowered: list[str] = []
-    for item in value:
+    for layer_index, item in enumerate(value):
         if not isinstance(item, str):
-            return None
-        lowered.append(item.lower())
+            raise ValueError(f"DSA indexer_types entries must be strings: layer={layer_index}, value={item!r}")
+        normalized = item.lower()
+        if normalized not in {"full", "shared"}:
+            raise ValueError(
+                f"DSA indexer_types entries must be 'full' or 'shared': layer={layer_index}, value={item!r}"
+            )
+        lowered.append(normalized)
     return tuple(lowered)
 
 
@@ -100,10 +110,7 @@ class DSAOffloadModelCapabilities:
     @property
     def has_shared_indexer_layers(self) -> bool:
         """是否存在复用他层 top-K 的 shared indexer 层（GLM-5.2 拓扑）。"""
-        return (
-            self.indexer_types is not None
-            and any(t == "shared" for t in self.indexer_types)
-        )
+        return self.indexer_types is not None and any(t == "shared" for t in self.indexer_types)
 
     @property
     def full_indexer_layer_indices(self) -> tuple[int, ...] | None:
