@@ -100,6 +100,18 @@ class MoEQuantParams:
         )
 
     @property
+    def mc2_dispatch_with_quant(self) -> bool:
+        """Whether MC2 should quantize activations during dispatch.
+
+        A5 MC2 dispatch cannot currently preserve the logical hidden width for
+        packed W4A4/MXFP4 activations. Keep that path unquantized and let the
+        MoE MLP quantize the dispatched BF16/FP16 activations instead. Other
+        dispatchers still use ``dispatch_with_quant`` and retain their existing
+        MXFP4 behavior.
+        """
+        return self.dispatch_with_quant and not self.is_w4a4_mxfp
+
+    @property
     def get_dst_type(self):
         if self.is_w4a4_mxfp:
             return torch_npu.float4_e2m1fn_x2

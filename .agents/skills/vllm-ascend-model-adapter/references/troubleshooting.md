@@ -136,6 +136,29 @@ Actions:
 3. If eager still fails, prioritize model/backend code fix path (not runtime flags only).
 4. Check `vllm-ascend` MLA/rope/platform implementation used by known-good runs.
 
+## A5 W4A4/MXFP4 MC2 dispatch doubles the hidden width
+
+Symptoms:
+
+- Failure is at `npu_moe_distribute_dispatch_v2`, before expert GMM1/GMM2.
+- CANN reports `expandX's dim1 not equal to xShape's dim1`, commonly with
+  `xShape=6144` and `expandX=12288`.
+- A DSA resident-token budget may coincidentally equal the model hidden size,
+  but DSA budgets count tokens and do not define MoE feature dimensions.
+
+Actions:
+
+1. Confirm the traceback ends in MC2 dispatch rather than combine. A combine
+   failure requires a separate GMM2/down-projection investigation.
+2. Keep A5 W4A4/MXFP4 unquantized during MC2 dispatch (`quant_mode=0`, no
+   packed `y_dtype`) and defer activation quantization to the MoE MLP.
+3. Clear any dispatch-returned dynamic scale on this unquantized path so the
+   MLP requantizes BF16/FP16 activations.
+4. Preserve the real `tp_recv_counts` for combine; the placeholder count is
+   only valid when MC2 dispatch actually quantized its output.
+5. Add regression coverage proving MXFP4 uses the fallback while MXFP8 retains
+   `quant_mode=4`, and validate with real W4A4 weights on A5 before sign-off.
+
 ## VL + TorchDynamo interpolate contiguous failure
 
 Symptoms:

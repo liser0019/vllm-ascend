@@ -157,14 +157,19 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         expert_map = token_dispatch_input.routing.expert_map
         global_redundant_expert_num = token_dispatch_input.routing.global_redundant_expert_num
         comm_quant_mode = token_dispatch_input.quant.comm_quant_mode
+        dispatch_with_quant = token_dispatch_input.quant.mc2_dispatch_with_quant
 
         assert expert_map is not None, "expert_map is required for MC2 token dispatch."
         # NOTE: quant_mode differs by quant feature:
         # - Legacy int communication quantization uses quant_mode=2.
-        # - A5 MXFP communication uses quant_mode=4.
-        if comm_quant_mode is not None:
+        # - A5 MXFP8 communication uses quant_mode=4.
+        # - A5 W4A4/MXFP4 stays unquantized during MC2 dispatch because the
+        #   packed output can be inferred with twice the logical hidden width.
+        if token_dispatch_input.quant.is_w4a4_mxfp:
+            quant_mode = 0
+        elif comm_quant_mode is not None:
             quant_mode = comm_quant_mode
-        elif token_dispatch_input.quant.dispatch_with_quant:
+        elif dispatch_with_quant:
             quant_mode = 4 if self.a5_need_extra_args and token_dispatch_input.quant.is_mxfp else 2
         else:
             quant_mode = 0
@@ -201,7 +206,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         if (
             self.a5_need_extra_args
             and (token_dispatch_input.quant.is_mxfp or token_dispatch_input.quant.is_fp8)
-            and token_dispatch_input.quant.dispatch_with_quant
+            and dispatch_with_quant
         ):
             y_dtype = torch.float8_e4m3fn
             if (
@@ -243,6 +248,12 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             expand_scales,
         ) = output[0:7]
 
+        # Some MC2 implementations return a scale tensor even for
+        # quant_mode=0. Do not let the MLP mistake the BF16/FP16 MXFP4 dispatch
+        # output for pre-quantized activations.
+        if token_dispatch_input.quant.is_w4a4_mxfp:
+            dynamic_scale = None
+
         group_list_type = kwargs_mc2["expert_token_nums_type"]
         return MoETokenDispatchOutput(
             hidden_states=expand_x,
@@ -276,7 +287,9 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         assert expert_map is not None
         # NOTE: quant_mode differs by quant features:
         # - A5 MXFP communication uses quant_mode=4 only for MXFP8 currently.
-        if comm_quant_mode is not None:
+        if combine_metadata.quant.is_w4a4_mxfp:
+            quant_mode = 0
+        elif comm_quant_mode is not None:
             quant_mode = comm_quant_mode
         elif quant_type == QuantType.MXFP8:
             quant_mode = 4
@@ -294,7 +307,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         if self.global_bs == 0:
             kwargs_mc2["x_active_mask"] = combine_metadata.mc2_mask
 
-        if combine_metadata.quant.dispatch_with_quant:
+        if combine_metadata.quant.mc2_dispatch_with_quant:
             tp_recv_counts = torch.empty(1, dtype=torch.int32, device=hidden_states.device)
 
         stage3_kwargs = {

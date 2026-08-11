@@ -360,7 +360,7 @@ class TestTokenDispatcherWithMC2(TestBase):
         self.assertEqual(kwargs["quant_mode"], 4)
         self.assertEqual(kwargs["y_dtype"], torch.float8_e4m3fn)
 
-    def test_get_dispatch_mc2_kwargs_with_mxfp4_quant(self):
+    def test_mxfp4_mc2_dispatch_defers_quantization_to_mlp(self):
         hidden_states = torch.randn(10, 128)
         topk_weights = torch.randn(10, 1)
         topk_ids = torch.randint(0, 8, (10, 1))
@@ -373,32 +373,44 @@ class TestTokenDispatcherWithMC2(TestBase):
             topk_ids=topk_ids,
             expert_map=expert_map,
             quant_type=QuantType.MXFP4,
+            comm_quant_mode=4,
             act_quant_type=MXFP4_TEST_DTYPE,
         )
         kwargs = self.dispatcher.get_dispatch_mc2_kwargs(token_dispatch_input)
 
         self.assertTrue(token_dispatch_input.quant.dispatch_with_quant)
-        self.assertEqual(kwargs["quant_mode"], 4)
-        self.assertIn("y_dtype", kwargs)
-        self.assertNotEqual(kwargs["y_dtype"], torch.float8_e4m3fn)
+        self.assertFalse(token_dispatch_input.quant.mc2_dispatch_with_quant)
+        self.assertEqual(kwargs["quant_mode"], 0)
+        self.assertNotIn("y_dtype", kwargs)
 
+        returned_dynamic_scale = torch.randn(10, 1)
+        tp_recv_counts = torch.tensor([10], dtype=torch.int64)
         with patch(
             "torch_npu.npu_moe_distribute_dispatch_v2",
             return_value=(
                 torch.randn(10, 128),
-                torch.randn(10, 1),
+                returned_dynamic_scale,
                 torch.arange(10, dtype=torch.int32),
                 torch.tensor([10], dtype=torch.int64),
                 torch.tensor([10], dtype=torch.int64),
-                torch.tensor([10], dtype=torch.int64),
+                tp_recv_counts,
                 torch.randn(10, 1),
             ),
         ) as mock_dispatch:
             output = self.dispatcher.token_dispatch(token_dispatch_input=token_dispatch_input)
 
         mock_dispatch.assert_called_once()
-        self.assertIsNotNone(output.dynamic_scale)
+        self.assertIsNone(output.dynamic_scale)
         self.assertTrue(output.combine_metadata.quant.dispatch_with_quant)
+        self.assertFalse(output.combine_metadata.quant.mc2_dispatch_with_quant)
+
+        self.dispatcher.moe_expert_num = len(expert_map)
+        combine_kwargs = self.dispatcher.get_combine_mc_kwargs(
+            torch.randn(10, 128),
+            output.combine_metadata,
+        )
+        self.assertIs(combine_kwargs["tp_send_counts"], tp_recv_counts)
+        self.assertEqual(combine_kwargs["comm_quant_mode"], 0)
 
 
 def test_allgather_token_dispatch_quant_mode_without_dynamic_scale():
