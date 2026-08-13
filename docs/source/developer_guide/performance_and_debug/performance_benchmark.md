@@ -45,7 +45,7 @@ pip install -r benchmarks/requirements-bench.txt
 
 ## 3. Run basic benchmarks
 
-This section introduces how to perform performance testing using the benchmark suite built into vLLM.
+This section introduces how to perform performance testing using the benchmark suite built into VLLM.
 
 ### 3.1 Dataset
 
