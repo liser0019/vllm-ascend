@@ -24,13 +24,13 @@ from vllm_ascend.attention.sfa_v1 import (
     custom_kv_rmsnorm_rope,
 )
 from vllm_ascend.attention.utils import get_sfa_qsfa_packed_head_dim
-from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.device.device_op import BaseDeviceAdaptor
 from vllm_ascend.quantization.methods import (
     AscendW8A8DynamicLinearMethod,
     AscendW8A8LinearMethod,
     AscendW8A8MXFP8DynamicLinearMethod,
 )
-from vllm_ascend.utils import enable_dsa_cp
+from vllm_ascend.utils import AscendDeviceType, enable_dsa_cp
 
 
 class TestAscendSFABackend(TestBase):
@@ -82,120 +82,107 @@ class TestAscendSFABackend(TestBase):
         self.assertIsNotNone(impl_cls)
 
 
-class TestAscendSFADeviceOperator(TestBase):
-    def _make_common_inputs(self):
-        ql_nope = torch.randn(3, 4, 8)
-        q_pe = torch.randn(3, 4, 2)
-        topk_indices = torch.zeros(3, 1, dtype=torch.int32)
-        attn_metadata = MagicMock()
-        attn_metadata.block_table = torch.zeros(1, 4, dtype=torch.int32)
-        actual_seq_lengths_query = torch.tensor([3], dtype=torch.int32)
-        actual_seq_lengths_key = torch.tensor([3], dtype=torch.int32)
-        impl = MagicMock()
-        impl.scale = 0.125
-        impl.qk_rope_head_dim = 2
-        impl.sfa_qsfa_tile_size = 128
-        return (
-            impl,
-            ql_nope,
-            q_pe,
-            topk_indices,
-            attn_metadata,
-            actual_seq_lengths_query,
-            actual_seq_lengths_key,
-        )
-
-    def test_execute_sparse_flash_attention_returns_softmax_components(self):
-        (
-            impl,
-            ql_nope,
-            q_pe,
-            topk_indices,
-            attn_metadata,
-            actual_seq_lengths_query,
-            actual_seq_lengths_key,
-        ) = self._make_common_inputs()
-        kv_cache = (
-            torch.randn(4, 1, 1, 8),
-            torch.randn(4, 1, 1, 2),
-        )
-        attn_output = torch.randn(3, 4, 8)
-        softmax_max = torch.zeros(1, 3, 4)
-        softmax_sum = torch.full((1, 3, 4), 2.0)
-
-        with patch.object(
-            torch.ops._C_ascend,
-            "npu_sparse_flash_attention",
-            create=True,
-            return_value=(attn_output, softmax_max, softmax_sum),
-        ) as mock_sfa:
-            output, actual_softmax_max, actual_softmax_sum = DeviceOperator.execute_sparse_flash_attention_process(
-                impl,
-                ql_nope,
-                q_pe,
-                kv_cache,
-                topk_indices,
-                attn_metadata,
-                actual_seq_lengths_query,
-                actual_seq_lengths_key,
-                return_lse=True,
-            )
-
-        self.assertIs(output, attn_output)
-        self.assertIs(actual_softmax_max, softmax_max)
-        self.assertIs(actual_softmax_sum, softmax_sum)
-        self.assertTrue(mock_sfa.call_args.kwargs["return_softmax_lse"])
-
-    def test_execute_sparse_flash_attention_c8_returns_softmax_components(self):
-        (
-            impl,
-            ql_nope,
-            q_pe,
-            topk_indices,
-            attn_metadata,
-            actual_seq_lengths_query,
-            actual_seq_lengths_key,
-        ) = self._make_common_inputs()
-        packed_kv_cache = (torch.empty(4, 1, 1, 12, dtype=torch.int8),)
-        attn_output = torch.randn(3, 4, 8)
-        softmax_max = torch.ones(1, 3, 4)
-        softmax_sum = torch.full((1, 3, 4), 3.0)
-
-        with (
-            patch.object(
-                torch.ops._C_ascend,
-                "npu_kv_quant_sparse_flash_attention",
-                create=True,
-                return_value=(attn_output, softmax_max, softmax_sum),
-            ) as mock_qsfa,
-            patch(
-                "vllm_ascend.device.device_op.torch_npu.npu_kv_quant_sparse_flash_attention",
-                create=True,
-                side_effect=AssertionError("C8 SFA with LSE must use the custom op"),
-            ),
+class TestAscendSFACacheComposition(TestBase):
+    def test_compose_independent_sfa_and_li_c8_layouts(self):
+        for enable_sfa_c8, enable_li_c8 in (
+            (False, False),
+            (True, False),
+            (False, True),
+            (True, True),
         ):
-            output, actual_softmax_max, actual_softmax_sum = DeviceOperator.execute_sparse_flash_attention_process(
-                impl,
-                ql_nope,
-                q_pe,
-                packed_kv_cache,
-                topk_indices,
-                attn_metadata,
-                actual_seq_lengths_query,
-                actual_seq_lengths_key,
-                sparse_mode=0,
-                return_lse=True,
-            )
+            with self.subTest(
+                enable_sfa_c8=enable_sfa_c8,
+                enable_li_c8=enable_li_c8,
+            ):
+                impl = AscendSFAImpl.__new__(AscendSFAImpl)
+                impl.layer_name = "model.layers.0.self_attn.attn"
+                impl.has_indexer = True
+                impl.enable_sparse_sfa_c8 = enable_sfa_c8
+                impl.enable_sparse_li_c8 = enable_li_c8
 
-        self.assertIs(output, attn_output)
-        self.assertIs(actual_softmax_max, softmax_max)
-        self.assertIs(actual_softmax_sum, softmax_sum)
-        call_kwargs = mock_qsfa.call_args.kwargs
-        self.assertIs(call_kwargs["key"], packed_kv_cache[0])
-        self.assertIs(call_kwargs["value"], packed_kv_cache[0])
-        self.assertEqual(call_kwargs["query"].shape, (3, 4, 10))
-        self.assertEqual(call_kwargs["sparse_mode"], 0)
-        self.assertTrue(call_kwargs["return_softmax_lse"])
+                main_cache = tuple(torch.empty(1) for _ in range(1 if enable_sfa_c8 else 2))
+                indexer_cache = tuple(torch.empty(1) for _ in range(2 if enable_li_c8 else 1))
+                impl.indexer = SimpleNamespace(
+                    k_cache=SimpleNamespace(kv_cache=indexer_cache)
+                )
+
+                composed = impl._compose_sfa_kv_cache(main_cache)
+
+                expected = (*main_cache, *indexer_cache)
+                self.assertIsNotNone(composed)
+                assert composed is not None
+                self.assertEqual(len(composed), len(expected))
+                for actual_tensor, expected_tensor in zip(composed, expected):
+                    self.assertIs(actual_tensor, expected_tensor)
+
+    @patch("vllm_ascend.attention.sfa_v1.get_ascend_config")
+    def test_li_c8_reshape_optim_requires_layer_li_c8(self, mock_get_ascend_config):
+        impl = AscendSFAImpl.__new__(AscendSFAImpl)
+        mock_get_ascend_config.return_value.c8_enable_reshape_optim = True
+
+        impl.enable_sparse_li_c8 = False
+        self.assertFalse(impl._use_li_c8_reshape_optim())
+
+        impl.enable_sparse_li_c8 = True
+        self.assertTrue(impl._use_li_c8_reshape_optim())
+
+        mock_get_ascend_config.return_value.c8_enable_reshape_optim = False
+        self.assertFalse(impl._use_li_c8_reshape_optim())
+
+    @patch(
+        "vllm_ascend.device.device_op.torch.ops._C_ascend.npu_lightning_indexer_quant",
+        create=True,
+    )
+    def test_li_c8_indexer_uses_cache_slots_after_main_cache(self, mock_indexer):
+        expected_topk = torch.zeros(2, 1, 4, dtype=torch.int32)
+        mock_indexer.return_value = expected_topk
+        q_li = torch.zeros(2, 1, 128, dtype=torch.int8)
+        q_li_scale = torch.ones(2, 1, dtype=torch.float16)
+        weights = torch.ones(2, 1, dtype=torch.bfloat16)
+        attn_metadata = SimpleNamespace(
+            block_table=torch.zeros(1, 2, dtype=torch.int32)
+        )
+
+        for enable_sfa_c8 in (False, True):
+            with self.subTest(enable_sfa_c8=enable_sfa_c8):
+                main_cache = (
+                    (torch.empty(2, 16, 1, 656, dtype=torch.int8),)
+                    if enable_sfa_c8
+                    else (
+                        torch.empty(2, 16, 1, 512, dtype=torch.bfloat16),
+                        torch.empty(2, 16, 1, 64, dtype=torch.bfloat16),
+                    )
+                )
+                indexer_k_cache = torch.empty(2, 16, 1, 128, dtype=torch.int8)
+                indexer_scale_cache = torch.empty(2, 16, 1, 1, dtype=torch.float16)
+                kv_cache = (*main_cache, indexer_k_cache, indexer_scale_cache)
+                impl = SimpleNamespace(
+                    enable_sparse_sfa_c8=enable_sfa_c8,
+                    use_torch_npu_lightning_indexer=False,
+                )
+                mock_indexer.reset_mock()
+
+                result = BaseDeviceAdaptor.indexer_select_post_process(
+                    impl,
+                    q_li,
+                    q_li_scale,
+                    q_li.shape,
+                    weights,
+                    kv_cache,
+                    attn_metadata,
+                    torch.tensor([2], dtype=torch.int32),
+                    torch.tensor([2], dtype=torch.int32),
+                    True,
+                    False,
+                )
+
+                self.assertIs(result, expected_topk)
+                call_kwargs = mock_indexer.call_args.kwargs
+                self.assertIs(call_kwargs["key"], indexer_k_cache)
+                self.assertEqual(
+                    call_kwargs["key_dequant_scale"].data_ptr(),
+                    indexer_scale_cache.data_ptr(),
+                )
 
 
 class TestAscendSFAKVQuantSparseAttention(TestBase):
@@ -228,7 +215,7 @@ class TestAscendSFAKVQuantSparseAttention(TestBase):
 
     def test_execute_kv_quant_sparse_flash_attention(self):
         impl = AscendSFAImpl.__new__(AscendSFAImpl)
-        impl.use_sparse_c8_sfa = True
+        impl.enable_sparse_sfa_c8 = True
         impl.scale = 0.125
         impl.sfa_qsfa_tile_size = 128
         impl.qk_rope_head_dim = 16
@@ -240,19 +227,11 @@ class TestAscendSFAKVQuantSparseAttention(TestBase):
         actual_seq_lengths = torch.tensor([3], dtype=torch.int32)
         expected = torch.randn(3, 2, 32)
 
-        with (
-            patch.object(
-                torch.ops._C_ascend,
-                "npu_kv_quant_sparse_flash_attention",
-                create=True,
-                return_value=(expected, torch.empty(0), torch.empty(0)),
-            ) as mock_qsfa,
-            patch(
-                "vllm_ascend.device.device_op.torch_npu.npu_kv_quant_sparse_flash_attention",
-                create=True,
-                side_effect=AssertionError("Base must use _C_ascend custom op"),
-            ),
-        ):
+        with patch(
+            "vllm_ascend.device.device_op.torch_npu.npu_kv_quant_sparse_flash_attention",
+            create=True,
+            return_value=expected,
+        ) as mock_qsfa:
             result = impl._execute_sparse_flash_attention_process(
                 ql_nope,
                 q_pe,
@@ -269,12 +248,11 @@ class TestAscendSFAKVQuantSparseAttention(TestBase):
         self.assertEqual(call_kwargs["query"].shape, (3, 2, 48))
         self.assertEqual(call_kwargs["key_quant_mode"], 2)
         self.assertEqual(call_kwargs["tile_size"], 128)
-        self.assertFalse(call_kwargs["return_softmax_lse"])
 
     def test_prolog_v3_enables_packed_int8_kv_cache(self):
         impl = AscendSFAImpl.__new__(AscendSFAImpl)
         impl._quant_type = AscendW8A8DynamicLinearMethod
-        impl.use_sparse_c8_sfa = True
+        impl.enable_sparse_sfa_c8 = True
         impl.has_indexer = True
         impl.sfa_qsfa_tile_size = 128
         impl.sfa_qsfa_k_nope_clip_alpha = torch.ones(1)
@@ -682,9 +660,10 @@ class TestAscendSFAImpl(TestBase):
         # Default ascend config (non-MLAPO, non-C8)
         mock_ascend_config = MagicMock()
         mock_ascend_config.enable_mlapo = False
-        mock_ascend_config.enable_sparse_c8 = False
+        mock_ascend_config.enable_sparse_sfa_c8 = False
+        mock_ascend_config.enable_sparse_li_c8 = False
         mock_ascend_config.enable_shared_expert_dp = False
-        mock_ascend_config.is_sparse_c8_layer.return_value = False
+        mock_ascend_config.is_sparse_li_c8_layer.return_value = False
         mock_get_ascend_config.return_value = mock_ascend_config
         self.mock_ascend_config = mock_ascend_config
 
@@ -831,10 +810,11 @@ class TestAscendSFAImpl(TestBase):
         mock_npu_kv_rmsnorm_rope_cache,
         mock_custom_kv_rmsnorm_rope,
     ):
-        """exec_kv with use_sparse_c8_sfa → delegates to custom_kv_rmsnorm_rope."""
-        self.impl.use_sparse_c8_sfa = True
+        """A5 SFA C8 with an indexer still uses custom KV preprocessing."""
+        self.impl.enable_sparse_sfa_c8 = True
         self.impl.c8_k_cache_dtype = torch.int8
         self.impl.enable_dsa_cp = False
+        self.impl.has_indexer = True
         self.impl.kv_a_layernorm = MagicMock()
         self.impl.kv_a_layernorm.weight = torch.ones(self.impl.kv_lora_rank)
         self.impl.kv_a_layernorm.variance_epsilon = 1e-5
@@ -858,7 +838,11 @@ class TestAscendSFAImpl(TestBase):
         )
         mock_custom_kv_rmsnorm_rope.return_value = fake_result
 
-        result = self.impl.exec_kv(kv_no_split, cos, sin, kv_cache, slots, MagicMock())
+        with patch(
+            "vllm_ascend.attention.sfa_v1.get_ascend_device_type",
+            return_value=AscendDeviceType.A5,
+        ):
+            result = self.impl.exec_kv(kv_no_split, cos, sin, kv_cache, slots, MagicMock())
         self.assertIs(result, fake_result)
         mock_npu_kv_rmsnorm_rope_cache.assert_not_called()
 
@@ -889,7 +873,7 @@ class TestAscendSFAImpl(TestBase):
         """W8A8Dynamic + C8 + PD consumer → PROLOG_V3."""
         self._set_quant(AscendW8A8DynamicLinearMethod)
         self.impl.is_kv_consumer = True
-        self.impl.use_sparse_c8_sfa = True
+        self.impl.enable_sparse_sfa_c8 = True
 
         path = self.impl._resolve_preprocess_type(torch.bfloat16)
         self.assertEqual(path, PreprocessType.PROLOG_V3)
@@ -906,7 +890,7 @@ class TestAscendSFAImpl(TestBase):
         """MXFP + is_kv_consumer + C8 → PROLOG_V3."""
         self._set_quant(AscendW8A8MXFP8DynamicLinearMethod)
         self.impl.is_kv_consumer = True
-        self.impl.use_sparse_c8_sfa = True
+        self.impl.enable_sparse_sfa_c8 = True
 
         path = self.impl._resolve_preprocess_type(torch.bfloat16)
         self.assertEqual(path, PreprocessType.PROLOG_V3)
@@ -915,7 +899,7 @@ class TestAscendSFAImpl(TestBase):
         """Unquantized + is_kv_consumer + C8 → PROLOG_V3 (blocked by reasons)."""
         self._set_quant(None)
         self.impl.is_kv_consumer = True
-        self.impl.use_sparse_c8_sfa = True
+        self.impl.enable_sparse_sfa_c8 = True
 
         path = self.impl._resolve_preprocess_type(torch.bfloat16)
         # Enters candidate but blocked by _get_fused_type_unsupported_reasons
@@ -934,7 +918,7 @@ class TestAscendSFAImpl(TestBase):
         """W8A8Dynamic+C8 enters PROLOG_V3 even when enable_mlapo=False."""
         self._set_quant(AscendW8A8DynamicLinearMethod)
         self.impl.is_kv_consumer = True
-        self.impl.use_sparse_c8_sfa = True
+        self.impl.enable_sparse_sfa_c8 = True
 
         path = self.impl._resolve_preprocess_type(torch.bfloat16)
         self.assertEqual(path, PreprocessType.PROLOG_V3)
@@ -969,7 +953,7 @@ class TestAscendSFAImpl(TestBase):
     def test_reasons_unquantized_c8_blocked(self):
         self._setup_prolog_v3_state()
         self.impl._quant_type = None
-        self.impl.use_sparse_c8_sfa = True
+        self.impl.enable_sparse_sfa_c8 = True
 
         reasons = self.impl._get_fused_type_unsupported_reasons(PreprocessType.PROLOG_V3)
         self.assertTrue(any("C8 sparse requires quantized" in r for r in reasons))
@@ -977,7 +961,7 @@ class TestAscendSFAImpl(TestBase):
     def test_reasons_mlapo_c8_blocked(self):
         self._setup_prolog_v3_state()
         self.impl.preprocess_type = PreprocessType.MLAPO
-        self.impl.use_sparse_c8_sfa = True
+        self.impl.enable_sparse_sfa_c8 = True
 
         reasons = self.impl._get_fused_type_unsupported_reasons(PreprocessType.MLAPO)
         self.assertTrue(any("sparse C8" in r for r in reasons))
@@ -988,7 +972,7 @@ class TestAscendSFAImpl(TestBase):
         """MXFP branch: npu_dynamic_mx_quant + q_c scale wrapping."""
         impl = AscendSFAImpl.__new__(AscendSFAImpl)
         impl._quant_type = AscendW8A8MXFP8DynamicLinearMethod
-        impl.use_sparse_c8_sfa = False
+        impl.enable_sparse_sfa_c8 = False
         impl.local_num_heads = 2
         impl.num_heads = 2
         impl.kv_lora_rank = 128
