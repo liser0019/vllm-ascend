@@ -238,13 +238,17 @@ class AscendConfig:
                     "enable_kv_nz is only supported in pd scenario and can only be used in D node."
                 )
 
-        self.enable_sparse_c8 = additional_config.get("enable_sparse_c8", False) and use_sparse
-        self.c8_enable_reshape_optim = self.enable_sparse_c8 and additional_config.get("c8_enable_reshape_optim", False)
-        quant_config = getattr(vllm_config, "quant_config", None)
-        self._sparse_c8_layer_ids, self._sparse_c8_layer_names = self._parse_sparse_c8_layers_from_quant_config(
-            quant_config
+        self.enable_sparse_sfa_c8 = additional_config.get("enable_sparse_sfa_c8", False) and use_sparse
+        self.enable_sparse_li_c8 = additional_config.get("enable_sparse_li_c8", False) and use_sparse
+        self.c8_enable_reshape_optim = self.enable_sparse_li_c8 and additional_config.get(
+            "c8_enable_reshape_optim", False
         )
-        self._sparse_c8_layer_filter_enabled = self._has_sparse_c8_layer_config(quant_config)
+        quant_config = getattr(vllm_config, "quant_config", None)
+        (
+            self._sparse_li_c8_layer_ids,
+            self._sparse_li_c8_layer_names,
+        ) = self._parse_sparse_li_c8_layers_from_quant_config(quant_config)
+        self._sparse_li_c8_layer_filter_enabled = self._has_sparse_li_c8_layer_config(quant_config)
         self.enable_sp_by_pass = (
             vllm_config.model_config is not None
             and not vllm_config.model_config.enforce_eager
@@ -278,6 +282,20 @@ class AscendConfig:
         # Enable Block Verify and Entropy Verify in Rejection Sampler
         rejection_sampler_config = additional_config.get("rejection_sampler_config", {})
         self.rejection_sampler_config = RejectionSamplerConfig(rejection_sampler_config)
+
+        self.sparse_kv_offload_config = SparseKVOffloadConfig(
+            self.vllm_config,
+            additional_config.get("sparse_kv_offload_config", {}),
+        )
+        self._validate_sparse_c8_kv_offload_compatibility()
+
+    def _validate_sparse_c8_kv_offload_compatibility(self) -> None:
+        if self.sparse_kv_offload_config.enabled and self.enable_sparse_sfa_c8:
+            raise NotImplementedError(
+                "Sparse KV offload does not support the sparse SFA C8 main "
+                "cache. Disable enable_sparse_sfa_c8; enable_sparse_li_c8 is "
+                "supported because the indexer cache remains device-resident."
+            )
 
     @staticmethod
     def _get_config_value(additional_config: dict[str, Any], config_key: str, env_key: str, env_value: Any) -> Any:
@@ -353,14 +371,15 @@ class AscendConfig:
         return dump_config_path
 
     @staticmethod
-    def _has_sparse_c8_layer_config(quant_config: Any) -> bool:
+    def _has_sparse_li_c8_layer_config(quant_config: Any) -> bool:
         quant_description = getattr(quant_config, "quant_description", None)
         if not isinstance(quant_description, dict):
             return False
-        return any(isinstance(key, str) and key.endswith(".indexer.quant_type") for key in quant_description)
+        quant_suffixes = (".indexer.quant_type", ".indexer.wq_b_weight")
+        return any(isinstance(key, str) and key.endswith(quant_suffixes) for key in quant_description)
 
     @classmethod
-    def _parse_sparse_c8_layers_from_quant_config(cls, quant_config: Any) -> tuple[set[int], set[str]]:
+    def _parse_sparse_li_c8_layers_from_quant_config(cls, quant_config: Any) -> tuple[set[int], set[str]]:
         quant_description = getattr(quant_config, "quant_description", None)
         if not isinstance(quant_description, dict):
             return set(), set()
@@ -385,10 +404,10 @@ class AscendConfig:
             layer_ids.add(extract_layer_index(layer_name))
         return layer_ids, layer_names
 
-    def is_sparse_c8_layer(self, layer_name: str | None) -> bool:
-        if not self.enable_sparse_c8:
+    def is_sparse_li_c8_layer(self, layer_name: str | None) -> bool:
+        if not self.enable_sparse_li_c8:
             return False
-        if not self._sparse_c8_layer_filter_enabled:
+        if not self._sparse_li_c8_layer_filter_enabled:
             return True
         if layer_name is None:
             return False
@@ -396,13 +415,13 @@ class AscendConfig:
         normalized_layer_name = layer_name.rstrip(".")
         if any(
             normalized_layer_name == candidate or normalized_layer_name.startswith(f"{candidate}.")
-            for candidate in self._sparse_c8_layer_names
+            for candidate in self._sparse_li_c8_layer_names
         ):
             return True
         from vllm.model_executor.models.utils import extract_layer_index
 
         layer_ids = {extract_layer_index(normalized_layer_name)}
-        return any(layer_id in self._sparse_c8_layer_ids for layer_id in layer_ids)
+        return any(layer_id in self._sparse_li_c8_layer_ids for layer_id in layer_ids)
 
     @staticmethod
     def _get_compile_ranges(compilation_config):
@@ -926,6 +945,48 @@ class SchedulerConfig:
                 env_key,
             )
         return default
+
+
+class SparseKVOffloadConfig:
+    """
+    Configuration for the Sparse KV cache offloading.
+    """
+
+    def __init__(self, vllm_config: "VllmConfig", user_config: dict[str, Any]):
+        self.enabled = bool(user_config.get("enabled", False))
+        if not self.enabled:
+            return
+
+        self.topk_buffer_size = int(user_config.get("topk_buffer_size", 4096))
+        self.dram_size_per_dp_GB = user_config.get("dram_size_per_dp_GB", 128)
+        self.keep_device_kv_cache = bool(user_config.get("keep_device_kv_cache", False))
+
+        if hasattr(vllm_config.model_config.hf_text_config, "compress_ratios"):
+            raise ValueError("Sparse KV offload don't support compress now.")
+        if not hasattr(vllm_config.model_config.hf_text_config, "index_topk"):
+            raise ValueError("Sparse KV offload only support sparse attention model.")
+        if self.keep_device_kv_cache:
+            logger.warning_once(
+                "Init sparse KV offload with keep_device_kv_cache enabled, "
+                "in this case we will still allocate device kv cache and can not improve sequence length or batch_size. "
+                "You should only use it for debugging in PD colocate scenario."
+            )
+        else:
+            if vllm_config.kv_transfer_config is None or not vllm_config.kv_transfer_config.is_kv_consumer:
+                raise AssertionError(
+                    "Sparse KV offload is only supported in PD disaggregate scenario "
+                    "and can only be used in D node. For debugging in PD colocate scenario, "
+                    "you can enable keep_device_kv_cache."
+                )
+
+        self.topk = vllm_config.model_config.hf_text_config.index_topk
+        if self.topk_buffer_size <= 0:
+            raise ValueError("sparse_kv_offload_config.topk_buffer_size must be positive")
+        if self.topk_buffer_size < self.topk:
+            raise ValueError(
+                "sparse_kv_offload_config.topk_buffer_size must be >= topk, "
+                f"got topk_buffer_size={self.topk_buffer_size}, topk={self.topk}"
+            )
 
 
 _ASCEND_CONFIG: AscendConfig | None = None
