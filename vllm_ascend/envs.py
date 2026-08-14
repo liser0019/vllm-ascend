@@ -128,7 +128,7 @@ env_variables: dict[str, Callable[[], Any]] = {
     # LRU and sparse_copy are selected. Set to 0 to A/B the legacy three-op
     # Compact -> ResidentAddrs -> SparseCopy path.
     "VLLM_ASCEND_SPARSE_KV_RUNTIME": lambda: bool(
-        int(os.getenv("VLLM_ASCEND_SPARSE_KV_RUNTIME", "1"))
+        int(os.getenv("VLLM_ASCEND_SPARSE_KV_RUNTIME", "0"))
     ),
 }
 

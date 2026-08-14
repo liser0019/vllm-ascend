@@ -32,7 +32,7 @@ The sparse KV manager has three experimental backend switches:
 | --- | --- | --- | --- |
 | `VLLM_ASCEND_SPARSE_KV_LRU_BACKEND` | `cpu`, `npu` | `cpu` | Run resident LRU compaction and address generation in the original OpenMP helper or the MemFabric NPU operators. |
 | `VLLM_ASCEND_SPARSE_KV_COPY_BACKEND` | `sparse_copy`, `cpu` | `sparse_copy` | Run the MemFabric AIV `sparse_copy` kernel or submit H2D/D2H copies through the Ascend ACL runtime from the CPU. |
-| `VLLM_ASCEND_SPARSE_KV_RUNTIME` | `0`, `1` | `1` | With the `npu` LRU and `sparse_copy` backends, use MemFabric's descriptor-free `SparseKvLoadRuntime` Plan -> Transfer path. Set to `0` to use the legacy three-operator path for A/B testing. |
+| `VLLM_ASCEND_SPARSE_KV_RUNTIME` | `0`, `1` | `0` | With the `npu` LRU and `sparse_copy` backends, opt into MemFabric's descriptor-free `SparseKvLoadRuntime` Plan -> Transfer path. It remains disabled by default until A5 validation is complete. |
 
 The `npu` LRU and `cpu` copy implementations are currently limited to a
 single TP rank. CPU copy is not graph-capturable and requires eager mode. To

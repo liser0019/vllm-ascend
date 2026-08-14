@@ -353,6 +353,7 @@ class SparseKVOffloadManager:
                 "support through offload.get_device_address()."
             )
         max_block_num = cdiv(self.max_model_len, self.block_size)
+        self.max_num_blocks = max_block_num
         self.block_table_cpu = torch.zeros(
             [self.max_num_reqs, max_block_num],
             dtype=torch.int32,
@@ -880,6 +881,36 @@ class SparseKVOffloadManager:
                 self.sparse_kv_plan_workspace_npu = torch.empty(
                     [plan_workspace_bytes], dtype=torch.uint8, device=device
                 )
+                # MemFabric receives raw data_ptr values and submits Plan and
+                # Transfer asynchronously.  Keep every runtime input whose
+                # layout may require copying/expansion in manager-owned NPU
+                # storage so Python temporaries cannot be reclaimed while the
+                # external kernels are still queued on the stream.
+                self.runtime_req_ids_npu = torch.empty(
+                    [self.max_num_topk_rows],
+                    dtype=torch.int64,
+                    device=device,
+                )
+                self.runtime_topk_indices_npu = torch.empty(
+                    [self.max_num_topk_rows, self.topk],
+                    dtype=torch.int32,
+                    device=device,
+                )
+                self.runtime_stable_prefix_lens_npu = torch.empty(
+                    [self.max_num_topk_rows],
+                    dtype=torch.int32,
+                    device=device,
+                )
+                self.runtime_block_table_npu = torch.empty(
+                    [self.max_num_topk_rows, self.max_num_blocks],
+                    dtype=torch.int32,
+                    device=device,
+                )
+                self.runtime_row_to_req_npu = torch.empty(
+                    [self.max_num_topk_rows],
+                    dtype=torch.int64,
+                    device=device,
+                )
             else:
                 self.lru_token_mark_workspace_npu = torch.zeros(
                     [self.lru_workspace_threads, self.max_model_len],
@@ -1135,14 +1166,43 @@ class SparseKVOffloadManager:
                 f"num_tokens={num_tokens}, max_num_topk_rows={self.max_num_topk_rows}"
             )
         if self.use_sparse_kv_runtime:
+            runtime_device = self.topk_buffers_k[layer_id].device
+            if (
+                block_table.device != runtime_device
+                or block_table.dtype != torch.int32
+            ):
+                raise ValueError(
+                    "SparseKvLoadRuntime block_table must be an int32 tensor "
+                    f"on {runtime_device}, got device={block_table.device}, "
+                    f"dtype={block_table.dtype}"
+                )
+            if (
+                block_table.ndim != 2
+                or block_table.shape[1] != self.max_num_blocks
+            ):
+                raise ValueError(
+                    "SparseKvLoadRuntime block_table must have shape "
+                    f"[rows, {self.max_num_blocks}], got "
+                    f"{tuple(block_table.shape)}"
+                )
+            block_table_npu = self.runtime_block_table_npu[:num_tokens]
             if token_to_req_npu is not None:
-                block_table_npu = torch.index_select(
+                row_to_req = self.runtime_row_to_req_npu[:num_tokens]
+                row_to_req.copy_(token_to_req_npu[:num_tokens])
+                torch.index_select(
                     block_table,
                     0,
-                    token_to_req_npu[:num_tokens].to(torch.int64),
+                    row_to_req,
+                    out=block_table_npu,
                 )
             else:
-                block_table_npu = block_table[:num_reqs]
+                if num_tokens != num_reqs:
+                    raise ValueError(
+                        "SparseKvLoadRuntime requires token_to_req_npu when "
+                        f"num_tokens ({num_tokens}) differs from num_reqs "
+                        f"({num_reqs})"
+                    )
+                block_table_npu.copy_(block_table[:num_tokens])
             # skip_topk means that the attention layer reused cached TopK
             # indices.  The descriptor-free path deliberately re-runs Plan for
             # this layer so its per-layer LRU state is updated; there is no
@@ -1340,12 +1400,20 @@ class SparseKVOffloadManager:
                 f"row, got rows={block_table_npu.shape[0]}, "
                 f"required={num_tokens}"
             )
-        req_ids_npu = req_ids_npu[:num_tokens].contiguous()
-        topk_indices_npu = topk_indices_npu[:num_tokens].contiguous()
-        stable_prefix_lens_npu = stable_prefix_lens_npu[
-            :num_tokens
-        ].contiguous()
-        block_table_npu = block_table_npu[:num_tokens].contiguous()
+        # Copy into persistent manager-owned tensors before exposing raw
+        # pointers to MemFabric.  These copies, Plan and Transfer are all
+        # queued on the current stream; no Host synchronization is required.
+        runtime_req_ids = self.runtime_req_ids_npu[:num_tokens]
+        runtime_topk_indices = self.runtime_topk_indices_npu[:num_tokens]
+        runtime_stable_prefix_lens = (
+            self.runtime_stable_prefix_lens_npu[:num_tokens]
+        )
+        runtime_req_ids.copy_(req_ids_npu[:num_tokens])
+        runtime_topk_indices.copy_(topk_indices_npu[:num_tokens])
+        runtime_stable_prefix_lens.copy_(
+            stable_prefix_lens_npu[:num_tokens]
+        )
+        block_table_npu = block_table_npu[:num_tokens]
         current_slots_output = current_slots_npu[:num_tokens]
         if not current_slots_output.is_contiguous():
             raise ValueError(
@@ -1353,10 +1421,10 @@ class SparseKVOffloadManager:
             )
 
         result = offload.sparse_kv_load_runtime(
-            req_ids_npu,
+            runtime_req_ids,
             self.lru_last_req_ids_npu_list[layer_id][:num_tokens],
-            topk_indices_npu,
-            stable_prefix_lens_npu,
+            runtime_topk_indices,
+            runtime_stable_prefix_lens,
             self.lru_slot_to_token_npu_list[layer_id][:num_tokens],
             self.lru_slots_npu_list[layer_id][:num_tokens],
             current_slots_output,
