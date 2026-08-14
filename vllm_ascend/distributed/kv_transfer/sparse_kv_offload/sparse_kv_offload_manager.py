@@ -296,6 +296,26 @@ class SparseKVOffloadManager:
                 "VLLM_ASCEND_SPARSE_KV_COPY_BACKEND must be 'cpu' or "
                 f"'sparse_copy', got {self.copy_backend!r}"
             )
+        runtime_compatible = (
+            self.lru_backend == LRU_BACKEND_NPU
+            and self.copy_backend == COPY_BACKEND_SPARSE_COPY
+        )
+        self.use_sparse_kv_runtime = (
+            runtime_compatible
+            and envs_ascend.VLLM_ASCEND_SPARSE_KV_RUNTIME
+            and hasattr(offload, "get_sparse_kv_plan_workspace_size")
+            and hasattr(offload, "sparse_kv_load_runtime")
+        )
+        if (
+            runtime_compatible
+            and envs_ascend.VLLM_ASCEND_SPARSE_KV_RUNTIME
+            and not self.use_sparse_kv_runtime
+        ):
+            logger.warning(
+                "The installed MemFabric package does not provide "
+                "SparseKvLoadRuntime; falling back to the legacy "
+                "Compact -> ResidentAddrs -> SparseCopy path."
+            )
         if self.tp_size != 1 and (
             self.lru_backend == LRU_BACKEND_NPU
             or self.copy_backend == COPY_BACKEND_CPU
@@ -304,7 +324,7 @@ class SparseKVOffloadManager:
                 "The experimental NPU LRU and CPU copy backends currently "
                 "support only tensor_parallel_size=1"
             )
-        if self.lru_backend == LRU_BACKEND_NPU:
+        if self.lru_backend == LRU_BACKEND_NPU and not self.use_sparse_kv_runtime:
             missing_ops = [
                 name
                 for name in (
@@ -324,6 +344,13 @@ class SparseKVOffloadManager:
             raise RuntimeError(
                 "The CPU copy backend requires torch.ops._C_ascend."
                 "swap_blocks_batch"
+            )
+        if self.copy_backend == COPY_BACKEND_SPARSE_COPY and not hasattr(
+            offload, "get_device_address"
+        ):
+            raise RuntimeError(
+                "The sparse_copy path requires MemFabric registered-Host-DVA "
+                "support through offload.get_device_address()."
             )
         max_block_num = cdiv(self.max_model_len, self.block_size)
         self.block_table_cpu = torch.zeros(
@@ -346,11 +373,13 @@ class SparseKVOffloadManager:
             self.sparse_kv_offload_cpp = None
 
         logger.warning(
-            "Sparse KV offload experimental backends: lru=%s, copy=%s. "
+            "Sparse KV offload experimental backends: lru=%s, copy=%s, "
+            "runtime=%s. "
             "The NPU LRU and CPU copy paths require single-rank validation; "
             "CPU copy also requires eager execution.",
             self.lru_backend,
             self.copy_backend,
+            self.use_sparse_kv_runtime,
         )
 
         logger.info(
@@ -364,6 +393,14 @@ class SparseKVOffloadManager:
         config.world_size = self.tp_size
         config.rank_id = self.tp_rank
         config.scene = offload.Scene.SHARED
+        if self.copy_backend == COPY_BACKEND_SPARSE_COPY:
+            if not hasattr(config, "register_host_memory"):
+                raise RuntimeError(
+                    "The installed MemFabric package cannot register its Host "
+                    "pool for NPU access; update MemFabric before selecting "
+                    "the sparse_copy or SparseKvLoadRuntime path."
+                )
+            config.register_host_memory = True
         assert offload.initialize(config) == 0, "Sparse KV offload offload.initialize failed."
         self.tp_group.barrier()
 
@@ -570,12 +607,21 @@ class SparseKVOffloadManager:
         gvas_k_tensor = torch.zeros([self.num_layers], dtype=torch.int64, device='npu')
         gvas_v_tensor = torch.zeros([self.num_layers], dtype=torch.int64, device='npu')
         cpu_block_lens_tensor = torch.zeros([self.num_layers, 2], dtype=torch.int64, device='npu')
+        self.host_dva_by_data_ptr: dict[int, int] = {}
         if self.tp_rank == 0:
             for layer_id in range(self.num_layers):
                 k_cpu = self.k_caches_cpu[layer_id]
                 v_cpu = self.v_caches_cpu[layer_id]
-                gvas_k_tensor[layer_id] = k_cpu.data_ptr()
-                gvas_v_tensor[layer_id] = v_cpu.data_ptr()
+                if self.copy_backend == COPY_BACKEND_SPARSE_COPY:
+                    k_dva = int(offload.get_device_address(k_cpu))
+                    v_dva = int(offload.get_device_address(v_cpu))
+                    self.host_dva_by_data_ptr[k_cpu.data_ptr()] = k_dva
+                    self.host_dva_by_data_ptr[v_cpu.data_ptr()] = v_dva
+                    gvas_k_tensor[layer_id] = k_dva
+                    gvas_v_tensor[layer_id] = v_dva
+                else:
+                    gvas_k_tensor[layer_id] = k_cpu.data_ptr()
+                    gvas_v_tensor[layer_id] = v_cpu.data_ptr()
                 cpu_block_lens_tensor[layer_id, 0] = (
                     k_cpu.numel() * k_cpu.element_size() // self.kv_cache_config.num_blocks
                 )
@@ -593,44 +639,61 @@ class SparseKVOffloadManager:
                 cpu_block_lens_tensor[layer_id, 1].item(),
             ))
 
-        gvas_buffer_offset = 0
-        gvas_buffer_size_bytes = self.max_num_topk_rows * self.topk * 2 * 8 # 2: k+v, 8: int64
-        addr_buffer_offset = gvas_buffer_offset + gvas_buffer_size_bytes
-        addr_buffer_size_bytes = self.max_num_topk_rows * self.topk * 2 * 8
-        size_buffer_offset = addr_buffer_offset + addr_buffer_size_bytes
-        size_buffer_size_bytes = self.max_num_topk_rows * self.topk * 2 * 4 # 2: k+v, 4: int32
-        num_tokens_buffer_offset = size_buffer_offset + size_buffer_size_bytes
-        num_tokens_buffer_size_bytes = 4 # 1 * int32
-        sparse_copy_args_buffer_size_bytes = gvas_buffer_size_bytes + addr_buffer_size_bytes + size_buffer_size_bytes + num_tokens_buffer_size_bytes
-        self.sparse_copy_args_buffer_cpu = torch.zeros([sparse_copy_args_buffer_size_bytes], dtype=torch.int8, device='cpu', pin_memory=True)
-        self.sparse_copy_args_buffer_npu = torch.zeros([sparse_copy_args_buffer_size_bytes], dtype=torch.int8, device='npu')
-
-        self.gvas_buffer_cpu = self.sparse_copy_args_buffer_cpu[gvas_buffer_offset:gvas_buffer_offset + gvas_buffer_size_bytes].view(torch.int64)
-        self.addr_buffer_cpu = self.sparse_copy_args_buffer_cpu[addr_buffer_offset:addr_buffer_offset + addr_buffer_size_bytes].view(torch.int64)
-        self.size_buffer_cpu = self.sparse_copy_args_buffer_cpu[size_buffer_offset:size_buffer_offset + size_buffer_size_bytes].view(torch.int32)
-        self.num_tokens_buffer_cpu = \
-            self.sparse_copy_args_buffer_cpu[num_tokens_buffer_offset:num_tokens_buffer_offset + num_tokens_buffer_size_bytes].view(torch.int32)
-        assert self.gvas_buffer_cpu.shape == torch.Size([self.max_num_topk_rows * self.topk * 2])
-        assert self.addr_buffer_cpu.shape == torch.Size([self.max_num_topk_rows * self.topk * 2])
-        assert self.size_buffer_cpu.shape == torch.Size([self.max_num_topk_rows * self.topk * 2])
-        assert self.num_tokens_buffer_cpu.shape == torch.Size([1])
-
-        self.gvas_buffer_npu = self.sparse_copy_args_buffer_npu[gvas_buffer_offset:gvas_buffer_offset + gvas_buffer_size_bytes].view(torch.int64)
-        self.addr_buffer_npu = self.sparse_copy_args_buffer_npu[addr_buffer_offset:addr_buffer_offset + addr_buffer_size_bytes].view(torch.int64)
-        self.size_buffer_npu = self.sparse_copy_args_buffer_npu[size_buffer_offset:size_buffer_offset + size_buffer_size_bytes].view(torch.int32)
-        self.num_tokens_buffer_npu = \
-            self.sparse_copy_args_buffer_npu[num_tokens_buffer_offset:num_tokens_buffer_offset + num_tokens_buffer_size_bytes].view(torch.int32)
-        assert self.gvas_buffer_npu.shape == torch.Size([self.max_num_topk_rows * self.topk * 2])
-        assert self.addr_buffer_npu.shape == torch.Size([self.max_num_topk_rows * self.topk * 2])
-        assert self.size_buffer_npu.shape == torch.Size([self.max_num_topk_rows * self.topk * 2])
-        assert self.num_tokens_buffer_npu.shape == torch.Size([1])
-        if self.copy_backend == COPY_BACKEND_CPU:
-            self.copy_sizes_cpu = torch.empty(
-                self.max_num_topk_rows * self.topk * 2,
-                dtype=torch.int64,
-                device="cpu",
+        # SparseKvLoadRuntime consumes the compact miss plan directly.  Only
+        # legacy CPU/three-op modes need the intermediate descriptor buffers.
+        if not self.use_sparse_kv_runtime:
+            gvas_buffer_offset = 0
+            gvas_buffer_size_bytes = self.max_num_topk_rows * self.topk * 2 * 8
+            addr_buffer_offset = gvas_buffer_offset + gvas_buffer_size_bytes
+            addr_buffer_size_bytes = self.max_num_topk_rows * self.topk * 2 * 8
+            size_buffer_offset = addr_buffer_offset + addr_buffer_size_bytes
+            size_buffer_size_bytes = self.max_num_topk_rows * self.topk * 2 * 4
+            num_tokens_buffer_offset = size_buffer_offset + size_buffer_size_bytes
+            num_tokens_buffer_size_bytes = 4
+            descriptor_bytes = (
+                gvas_buffer_size_bytes + addr_buffer_size_bytes
+                + size_buffer_size_bytes + num_tokens_buffer_size_bytes
+            )
+            self.sparse_copy_args_buffer_cpu = torch.zeros(
+                [descriptor_bytes], dtype=torch.int8, device='cpu',
                 pin_memory=True,
             )
+            self.sparse_copy_args_buffer_npu = torch.zeros(
+                [descriptor_bytes], dtype=torch.int8, device=device,
+            )
+            self.gvas_buffer_cpu = self.sparse_copy_args_buffer_cpu[
+                gvas_buffer_offset:gvas_buffer_offset + gvas_buffer_size_bytes
+            ].view(torch.int64)
+            self.addr_buffer_cpu = self.sparse_copy_args_buffer_cpu[
+                addr_buffer_offset:addr_buffer_offset + addr_buffer_size_bytes
+            ].view(torch.int64)
+            self.size_buffer_cpu = self.sparse_copy_args_buffer_cpu[
+                size_buffer_offset:size_buffer_offset + size_buffer_size_bytes
+            ].view(torch.int32)
+            self.num_tokens_buffer_cpu = self.sparse_copy_args_buffer_cpu[
+                num_tokens_buffer_offset:
+                num_tokens_buffer_offset + num_tokens_buffer_size_bytes
+            ].view(torch.int32)
+            self.gvas_buffer_npu = self.sparse_copy_args_buffer_npu[
+                gvas_buffer_offset:gvas_buffer_offset + gvas_buffer_size_bytes
+            ].view(torch.int64)
+            self.addr_buffer_npu = self.sparse_copy_args_buffer_npu[
+                addr_buffer_offset:addr_buffer_offset + addr_buffer_size_bytes
+            ].view(torch.int64)
+            self.size_buffer_npu = self.sparse_copy_args_buffer_npu[
+                size_buffer_offset:size_buffer_offset + size_buffer_size_bytes
+            ].view(torch.int32)
+            self.num_tokens_buffer_npu = self.sparse_copy_args_buffer_npu[
+                num_tokens_buffer_offset:
+                num_tokens_buffer_offset + num_tokens_buffer_size_bytes
+            ].view(torch.int32)
+            if self.copy_backend == COPY_BACKEND_CPU:
+                self.copy_sizes_cpu = torch.empty(
+                    self.max_num_topk_rows * self.topk * 2,
+                    dtype=torch.int64,
+                    device="cpu",
+                    pin_memory=True,
+                )
 
         # topk cache reuse related
         self.lru_workspace_threads = 8
@@ -801,22 +864,39 @@ class SparseKVOffloadManager:
                 )
                 for _ in range(self.num_layers)
             ]
-            self.lru_token_mark_workspace_npu = torch.zeros(
-                [self.lru_workspace_threads, self.max_model_len],
-                dtype=torch.int32,
-                device=device,
-            )
-            self.lru_token_pos_workspace_npu = torch.full(
-                [self.lru_workspace_threads, self.max_model_len],
-                -1,
-                dtype=torch.int32,
-                device=device,
-            )
-            self.lru_epochs_npu = torch.zeros(
-                [self.lru_workspace_threads],
-                dtype=torch.int32,
-                device=device,
-            )
+            if self.use_sparse_kv_runtime:
+                plan_workspace_bytes = int(
+                    offload.get_sparse_kv_plan_workspace_size(
+                        self.max_num_topk_rows,
+                        self.topk,
+                        self.topk_buffer_size,
+                    )
+                )
+                if plan_workspace_bytes <= 0:
+                    raise RuntimeError(
+                        "MemFabric returned an invalid SparseKvPlanRuntime "
+                        f"workspace size: {plan_workspace_bytes}"
+                    )
+                self.sparse_kv_plan_workspace_npu = torch.empty(
+                    [plan_workspace_bytes], dtype=torch.uint8, device=device
+                )
+            else:
+                self.lru_token_mark_workspace_npu = torch.zeros(
+                    [self.lru_workspace_threads, self.max_model_len],
+                    dtype=torch.int32,
+                    device=device,
+                )
+                self.lru_token_pos_workspace_npu = torch.full(
+                    [self.lru_workspace_threads, self.max_model_len],
+                    -1,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                self.lru_epochs_npu = torch.zeros(
+                    [self.lru_workspace_threads],
+                    dtype=torch.int32,
+                    device=device,
+                )
 
     def _check_cpu_copy_runtime(self, capturing: bool) -> None:
         if self.copy_backend == COPY_BACKEND_CPU and capturing:
@@ -968,8 +1048,20 @@ class SparseKVOffloadManager:
             src_k = int(k_rows.data_ptr()) + token_indices * self.token_size_bytes_k
             src_v = int(v_rows.data_ptr()) + token_indices * self.token_size_bytes_v
 
-        dst_k = int(k_cache_cpu.data_ptr()) + safe_slots * self.token_size_bytes_k
-        dst_v = int(v_cache_cpu.data_ptr()) + safe_slots * self.token_size_bytes_v
+        if self.copy_backend == COPY_BACKEND_SPARSE_COPY:
+            try:
+                dst_k_base = self.host_dva_by_data_ptr[k_cache_cpu.data_ptr()]
+                dst_v_base = self.host_dva_by_data_ptr[v_cache_cpu.data_ptr()]
+            except KeyError as error:
+                raise RuntimeError(
+                    "Sparse KV Host cache is not present in the registered-DVA "
+                    "mapping created by register_kv_caches()."
+                ) from error
+        else:
+            dst_k_base = int(k_cache_cpu.data_ptr())
+            dst_v_base = int(v_cache_cpu.data_ptr())
+        dst_k = dst_k_base + safe_slots * self.token_size_bytes_k
+        dst_v = dst_v_base + safe_slots * self.token_size_bytes_v
         self.d2h_src_ptrs_npu[:token_count].copy_(src_k)
         self.d2h_src_ptrs_npu[token_count : 2 * token_count].copy_(src_v)
         self.d2h_dst_ptrs_npu[:token_count].copy_(dst_k)
@@ -1042,6 +1134,29 @@ class SparseKVOffloadManager:
                 "Sparse KV offload topk rows exceed configured workspace, "
                 f"num_tokens={num_tokens}, max_num_topk_rows={self.max_num_topk_rows}"
             )
+        if self.use_sparse_kv_runtime:
+            if token_to_req_npu is not None:
+                block_table_npu = torch.index_select(
+                    block_table,
+                    0,
+                    token_to_req_npu[:num_tokens].to(torch.int64),
+                )
+            else:
+                block_table_npu = block_table[:num_reqs]
+            # skip_topk means that the attention layer reused cached TopK
+            # indices.  The descriptor-free path deliberately re-runs Plan for
+            # this layer so its per-layer LRU state is updated; there is no
+            # global descriptor array to offset/reuse as in the legacy path.
+            self._onload_topk_kv_runtime(
+                layer_id,
+                num_tokens,
+                block_table_npu,
+                topk_indices_npu,
+                current_slots_npu,
+                req_ids_npu,
+                stable_prefix_lens_npu,
+            )
+            return
         if (
             self.lru_backend == LRU_BACKEND_CPU
             and layer_id in [0, self.mtp_layer_id]
@@ -1192,6 +1307,78 @@ class SparseKVOffloadManager:
         else:
             current_slots_npu[:num_tokens].copy_(
                 self.lru_current_slots_npu[:num_tokens]
+            )
+
+    def _onload_topk_kv_runtime(
+        self,
+        layer_id: int,
+        num_tokens: int,
+        block_table_npu: torch.Tensor,
+        topk_indices_npu: torch.Tensor,
+        current_slots_npu: torch.Tensor,
+        req_ids_npu: torch.Tensor,
+        stable_prefix_lens_npu: torch.Tensor,
+    ) -> None:
+        device = self.topk_buffers_k[layer_id].device
+        npu_inputs = (
+            ("req_ids", req_ids_npu, torch.int64),
+            ("topk_indices", topk_indices_npu, torch.int32),
+            ("stable_prefix_lens", stable_prefix_lens_npu, torch.int32),
+            ("block_table", block_table_npu, torch.int32),
+            ("current_slots", current_slots_npu, torch.int32),
+        )
+        for name, tensor, expected_dtype in npu_inputs:
+            if tensor.device != device or tensor.dtype != expected_dtype:
+                raise ValueError(
+                    f"SparseKvLoadRuntime input {name} must be a {device} "
+                    f"{expected_dtype} tensor, got device={tensor.device}, "
+                    f"dtype={tensor.dtype}"
+                )
+        if block_table_npu.ndim != 2 or block_table_npu.shape[0] < num_tokens:
+            raise ValueError(
+                "SparseKvLoadRuntime requires one block-table row per TopK "
+                f"row, got rows={block_table_npu.shape[0]}, "
+                f"required={num_tokens}"
+            )
+        req_ids_npu = req_ids_npu[:num_tokens].contiguous()
+        topk_indices_npu = topk_indices_npu[:num_tokens].contiguous()
+        stable_prefix_lens_npu = stable_prefix_lens_npu[
+            :num_tokens
+        ].contiguous()
+        block_table_npu = block_table_npu[:num_tokens].contiguous()
+        current_slots_output = current_slots_npu[:num_tokens]
+        if not current_slots_output.is_contiguous():
+            raise ValueError(
+                "SparseKvLoadRuntime current_slots output must be contiguous"
+            )
+
+        result = offload.sparse_kv_load_runtime(
+            req_ids_npu,
+            self.lru_last_req_ids_npu_list[layer_id][:num_tokens],
+            topk_indices_npu,
+            stable_prefix_lens_npu,
+            self.lru_slot_to_token_npu_list[layer_id][:num_tokens],
+            self.lru_slots_npu_list[layer_id][:num_tokens],
+            current_slots_output,
+            self.lru_miss_count_npu_list[layer_id][:num_tokens],
+            self.lru_miss_tokens_npu_list[layer_id][:num_tokens],
+            self.lru_miss_slots_npu_list[layer_id][:num_tokens],
+            self.sparse_kv_plan_workspace_npu,
+            block_table_npu,
+            self.gvas_k_bases[layer_id],
+            self.gvas_v_bases[layer_id],
+            self.addr_k_bases[layer_id],
+            self.addr_v_bases[layer_id],
+            self.block_size,
+            self.token_size_bytes_k,
+            self.token_size_bytes_v,
+            self.max_model_len,
+            device,
+        )
+        if result not in (None, 0):
+            raise RuntimeError(
+                "memfabric sparse_kv_load_runtime failed with "
+                f"result={result}"
             )
 
     def _onload_topk_kv_npu(

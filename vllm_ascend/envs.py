@@ -124,6 +124,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_SPARSE_KV_COPY_BACKEND": lambda: os.getenv(
         "VLLM_ASCEND_SPARSE_KV_COPY_BACKEND", "sparse_copy"
     ).lower(),
+    # Use the descriptor-free MemFabric SparseKvLoadRuntime API when both NPU
+    # LRU and sparse_copy are selected. Set to 0 to A/B the legacy three-op
+    # Compact -> ResidentAddrs -> SparseCopy path.
+    "VLLM_ASCEND_SPARSE_KV_RUNTIME": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_SPARSE_KV_RUNTIME", "1"))
+    ),
 }
 
 # end-env-vars-definition
