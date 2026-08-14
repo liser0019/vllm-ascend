@@ -886,6 +886,14 @@ class SparseKVOffloadManager:
                 # layout may require copying/expansion in manager-owned NPU
                 # storage so Python temporaries cannot be reclaimed while the
                 # external kernels are still queued on the stream.
+                #
+                # Contract: metadata copies, MemFabric Plan and MemFabric
+                # Transfer are submitted on the same current NPU stream, so
+                # this single staging set is not reused until prior consumers
+                # on that stream have run.  If future execution permits
+                # concurrent SparseKvLoadRuntime submissions from multiple
+                # streams, replace these tensors with per-stream or
+                # double-buffered storage plus explicit stream ordering.
                 self.runtime_req_ids_npu = torch.empty(
                     [self.max_num_topk_rows],
                     dtype=torch.int64,
@@ -1402,7 +1410,10 @@ class SparseKVOffloadManager:
             )
         # Copy into persistent manager-owned tensors before exposing raw
         # pointers to MemFabric.  These copies, Plan and Transfer are all
-        # queued on the current stream; no Host synchronization is required.
+        # queued on the same current stream; no Host synchronization is
+        # required.  Reusing this staging from concurrent NPU streams is not
+        # supported by this contract and would require per-stream/double-
+        # buffered storage with explicit ordering.
         runtime_req_ids = self.runtime_req_ids_npu[:num_tokens]
         runtime_topk_indices = self.runtime_topk_indices_npu[:num_tokens]
         runtime_stable_prefix_lens = (
