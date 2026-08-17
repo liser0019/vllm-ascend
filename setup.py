@@ -22,6 +22,7 @@ import logging
 import os
 import subprocess
 import sys
+from pathlib import Path
 from sysconfig import get_paths
 
 from setuptools import Command, Extension, find_packages, setup
@@ -40,7 +41,10 @@ def load_module_from_path(module_name, path):
     return module
 
 
-ROOT_DIR = os.path.dirname(__file__)
+# pip/PEP 517 may execute this file with __file__ == "setup.py".  Resolve it
+# once so every build path remains absolute and independent of the caller's
+# current working directory.
+ROOT_DIR = str(Path(__file__).resolve().parent)
 logger = logging.getLogger(__name__)
 
 
@@ -224,7 +228,11 @@ class build_and_install_aclnn(Command):
     def run(self):
         try:
             print("Running bash build_aclnn.sh ...")
-            subprocess.check_call(["bash", "csrc/build_aclnn.sh", ROOT_DIR, envs.SOC_VERSION])
+            build_script = os.path.join(ROOT_DIR, "csrc", "build_aclnn.sh")
+            subprocess.check_call(
+                ["bash", build_script, ROOT_DIR, envs.SOC_VERSION],
+                cwd=ROOT_DIR,
+            )
             print("build_aclnn.sh executed successfully!")
         except subprocess.CalledProcessError as e:
             print(f"Error running build_aclnn.sh: {e}")
@@ -451,7 +459,6 @@ class custom_install(install):
         install.run(self)
 
 
-ROOT_DIR = os.path.dirname(__file__)
 try:
     VERSION = get_version(write_to="vllm_ascend/_version.py")
 except LookupError:
