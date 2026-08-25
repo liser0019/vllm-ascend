@@ -167,6 +167,7 @@ def test_runtime_raw_pointer_inputs_use_persistent_staging() -> None:
     manager.token_size_bytes_k = 8
     manager.token_size_bytes_v = 4
     manager.max_model_len = 128
+    manager.num_physical_blocks = 32
 
     req_ids = torch.tensor([10, 11], dtype=torch.int64)
     topk_storage = torch.arange(rows * topk * 2, dtype=torch.int32).view(
@@ -201,3 +202,4 @@ def test_runtime_raw_pointer_inputs_use_persistent_staging() -> None:
     assert torch.equal(args[0], req_ids)
     assert torch.equal(args[2], topk_input)
     assert torch.equal(args[3], stable_prefix)
+    assert args[-2] == manager.num_physical_blocks

@@ -259,6 +259,12 @@ class SparseKVOffloadManager:
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
         self.sparse_kv_offload_config = sparse_kv_offload_config
+        self.num_physical_blocks = int(self.kv_cache_config.num_blocks)
+        if self.num_physical_blocks <= 0:
+            raise ValueError(
+                "Sparse KV offload requires a positive Host KV physical "
+                f"block count, got {self.num_physical_blocks}"
+            )
 
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
@@ -613,6 +619,28 @@ class SparseKVOffloadManager:
             for layer_id in range(self.num_layers):
                 k_cpu = self.k_caches_cpu[layer_id]
                 v_cpu = self.v_caches_cpu[layer_id]
+                expected_k_bytes = (
+                    self.num_physical_blocks
+                    * self.block_size
+                    * self.token_size_bytes_k
+                )
+                expected_v_bytes = (
+                    self.num_physical_blocks
+                    * self.block_size
+                    * self.token_size_bytes_v
+                )
+                actual_k_bytes = k_cpu.numel() * k_cpu.element_size()
+                actual_v_bytes = v_cpu.numel() * v_cpu.element_size()
+                if (actual_k_bytes != expected_k_bytes
+                        or actual_v_bytes != expected_v_bytes):
+                    raise RuntimeError(
+                        "Sparse KV Host pool geometry does not match the "
+                        "configured physical block count: "
+                        f"layer={layer_id}, blocks={self.num_physical_blocks}, "
+                        f"K actual/expected={actual_k_bytes}/"
+                        f"{expected_k_bytes}, V actual/expected="
+                        f"{actual_v_bytes}/{expected_v_bytes}"
+                    )
                 if self.copy_backend == COPY_BACKEND_SPARSE_COPY:
                     k_dva = int(offload.get_device_address(k_cpu))
                     v_dva = int(offload.get_device_address(v_cpu))
@@ -1452,6 +1480,7 @@ class SparseKVOffloadManager:
             self.token_size_bytes_k,
             self.token_size_bytes_v,
             self.max_model_len,
+            self.num_physical_blocks,
             device,
         )
         if result not in (None, 0):
